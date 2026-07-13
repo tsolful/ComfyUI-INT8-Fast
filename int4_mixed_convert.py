@@ -254,6 +254,309 @@ def _calibrate_activation_errors(model, positive, negative, latent, steps, cfg,
     return {k: s / max(1, n) for k, (s, n) in stats.items()}
 
 
+# ---------------------------------------------------------------------------
+# calibrated+ : per-layer tier decisions from measured output error
+# ---------------------------------------------------------------------------
+
+# Error-threshold presets: (rel_rmse_int4mm, cos_int4mm, rel_rmse_int8mm, cos_int8mm)
+# A layer gets the cheapest tier whose simulated output stays within thresholds;
+# layers failing both go to full int8_tensorwise. Strictest -> loosest:
+# QualityQ > Quality > QualityS ~ BalancedQ > Balanced > BalancedS.
+_CALIB_PLUS_PRESETS = {
+    "QualityQ":  (0.035, 0.9985, 0.070, 0.9930),
+    "Quality":   (0.050, 0.9975, 0.100, 0.9900),
+    "QualityS":  (0.070, 0.9960, 0.140, 0.9860),
+    "BalancedQ": (0.070, 0.9930, 0.130, 0.9820),
+    "Balanced":  (0.100, 0.9900, 0.180, 0.9750),
+    "BalancedS": (0.140, 0.9850, 0.250, 0.9650),
+}
+
+_CALIB_PLUS_MAX_SIMS = 12   # per-layer cap on simulated forward measurements
+_CALIB_PLUS_TOKENS = 256    # activation rows sampled per measurement
+
+
+@torch.no_grad()
+def _output_metrics(y, ref):
+    """Quality metrics of a simulated quantized output vs the bf16 reference.
+    Mirrors the Metrics.md suite at per-layer scope."""
+    err = y - ref
+    ref_pow = ref.pow(2).mean().clamp(min=1e-20)
+    mse = err.pow(2).mean()
+    denom = y.norm().clamp(min=1e-12) * ref.norm().clamp(min=1e-12)
+    ch = err.pow(2).mean(dim=0)
+    return {
+        "mse": mse.item(),
+        "mae": err.abs().mean().item(),
+        "max": err.abs().max().item(),
+        "rel": (mse / ref_pow).sqrt().item(),
+        "snr": (10.0 * torch.log10(ref_pow / mse.clamp(min=1e-20))).item(),
+        "cos": ((y.flatten() @ ref.flatten()) / denom).item(),
+        "var": (y.var() / ref.var().clamp(min=1e-20)).item(),
+        "outl": (err.abs() > 0.1 * ref.std()).float().mean().item(),
+        "chmax": ch.max().item(),
+        "chstd": ch.std().item(),
+        # Worst per-channel RMSE relative to the LAYER-wide signal RMS —
+        # catches localized channel damage that averages hide. Normalized
+        # against the layer scale, NOT per-channel power: near-silent
+        # channels would otherwise inflate the ratio and veto every layer
+        # (observed on z-image, where the old gate blocked all int4).
+        "chrel": (ch / ref_pow).max().sqrt().item(),
+    }
+
+
+@torch.no_grad()
+def _tier_sim_metrics(x, w, rot_gs):
+    """Simulate all three tiers for one linear on real activations.
+
+    x: (tokens, in) float32; w: (out, in) float32, same device.
+    Tiers: int8 (per-row W8 + per-token A8), int8mm (group-64 W4 + A8),
+    int4mm (group-64 W4 + group-64 A4). Weight is processed in row chunks to
+    bound memory. Returns {"int8": {...}, "int8mm": {...}, "int4mm": {...}}.
+    """
+    device = x.device
+    H = build_hadamard(rot_gs, device=device, dtype=torch.float32) if rot_gs else None
+    xr = rotate_activation(x, H, group_size=rot_gs) if H is not None else x
+
+    # Activation quants (per token)
+    a_scale8 = xr.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 127.0
+    xa8 = (xr / a_scale8).round_().clamp_(-127, 127).mul_(a_scale8)
+    t, c = xr.shape
+    gact = xr.view(t, c // W4A4_QUANT_GROUP_SIZE, W4A4_QUANT_GROUP_SIZE)
+    a_scale4 = gact.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 7.0
+    xa4 = (gact / a_scale4).round_().clamp_(-8, 7).mul_(a_scale4).view(t, c)
+
+    out_f, in_f = w.shape
+    y_ref = torch.empty((t, out_f), dtype=torch.float32, device=device)
+    y8 = torch.empty_like(y_ref)
+    y48 = torch.empty_like(y_ref)
+    y44 = torch.empty_like(y_ref)
+
+    chunk = max(256, (1 << 24) // max(in_f * 4, 1))  # ~16MB fp32 of W rows
+    for r0 in range(0, out_f, chunk):
+        wc = w[r0:r0 + chunk]
+        wr = rotate_weight(wc, H, group_size=rot_gs) if H is not None else wc
+        # per-row INT8 weight
+        s8 = wr.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / 127.0
+        w8 = (wr / s8).round_().clamp_(-127, 127).mul_(s8)
+        # group-64 INT4 weight
+        gw = wr.view(wr.shape[0], in_f // W4A4_QUANT_GROUP_SIZE, W4A4_QUANT_GROUP_SIZE)
+        s4 = gw.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 7.0
+        w4 = (gw / s4).round_().clamp_(-8, 7).mul_(s4).view(wr.shape[0], in_f)
+
+        y_ref[:, r0:r0 + chunk] = xr @ wr.T
+        y8[:, r0:r0 + chunk] = xa8 @ w8.T
+        y48[:, r0:r0 + chunk] = xa8 @ w4.T
+        y44[:, r0:r0 + chunk] = xa4 @ w4.T
+        del wc, wr, w8, gw, w4
+
+    return {
+        "int8": _output_metrics(y8, y_ref),
+        "int8mm": _output_metrics(y48, y_ref),
+        "int4mm": _output_metrics(y44, y_ref),
+    }
+
+
+def _calibrate_tier_metrics(model, positive, negative, latent, steps, cfg, seed,
+                            candidate_map):
+    """calibrated+ measurement pass: hooks simulate all three tiers per layer
+    on real activations during a short sampling run.
+
+    Returns {sd_key: {"n": int, "tiers": {tier: [metric dicts in call order]}}}.
+    """
+    import comfy.sample
+
+    stats = {}
+    handles = []
+
+    def make_hook(key, rot_gs):
+        def hook(module, args):
+            x = args[0] if args else None
+            if not isinstance(x, torch.Tensor):
+                return
+            rec = stats.setdefault(
+                key, {"n": 0, "tiers": {"int8": [], "int8mm": [], "int4mm": []}})
+            if rec["n"] >= _CALIB_PLUS_MAX_SIMS:
+                return
+            w = getattr(module, "weight", None)
+            if not isinstance(w, torch.Tensor) or w.ndim != 2:
+                return
+            try:
+                x2 = x.reshape(-1, x.shape[-1])
+                if x2.shape[0] > _CALIB_PLUS_TOKENS:
+                    x2 = x2[:_CALIB_PLUS_TOKENS]
+                x2 = x2.float()
+                wf = w.to(device=x2.device, dtype=torch.float32)
+                res = _tier_sim_metrics(x2, wf, rot_gs)
+                del wf
+            except Exception as e:
+                logging.debug(f"INT4 Mixed Save: calibrated+ sim failed for {key}: {e}")
+                return
+            rec["n"] += 1
+            for tname, m in res.items():
+                rec["tiers"][tname].append(m)
+        return hook
+
+    hooked = 0
+    for name, module in model.model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        key = _strip_model_prefix(name) + ".weight"
+        if key not in candidate_map:
+            continue
+        handles.append(module.register_forward_pre_hook(make_hook(key, candidate_map[key])))
+        hooked += 1
+
+    if hooked == 0:
+        for h in handles:
+            h.remove()
+        raise RuntimeError(
+            "INT4 Mixed Save: calibrated+ model layers do not match the selected "
+            "checkpoint (0 hooks placed). Connect the SAME model file, loaded in "
+            "high precision with the stock 'Load Diffusion Model' node."
+        )
+
+    logging.info(
+        f"INT4 Mixed Save: calibrated+ measuring {hooked} layers x 3 tiers "
+        f"over {steps} steps (this is slower than plain 'calibrated')..."
+    )
+    try:
+        latent_img = latent["samples"]
+        if hasattr(comfy.sample, "fix_empty_latent_channels"):
+            latent_img = comfy.sample.fix_empty_latent_channels(model, latent_img)
+        noise = comfy.sample.prepare_noise(latent_img, seed)
+        comfy.sample.sample(
+            model, noise, steps, cfg, "euler", "simple",
+            positive, negative, latent_img,
+            denoise=1.0, seed=seed, disable_pbar=True,
+        )
+    finally:
+        for h in handles:
+            h.remove()
+
+    return stats
+
+
+def _mean_and_drift(mlist):
+    """Aggregate a per-call metric list: mean of every metric plus the linear
+    drift slope of MSE and cos-sim across call order (per-step trend)."""
+    n = len(mlist)
+    mean = {k: sum(m[k] for m in mlist) / n for k in mlist[0]}
+
+    def slope(vals):
+        if n < 3:
+            return 0.0
+        xm = (n - 1) / 2.0
+        ym = sum(vals) / n
+        den = sum((i - xm) ** 2 for i in range(n)) or 1.0
+        return sum((i - xm) * (v - ym) for i, v in enumerate(vals)) / den
+
+    mean["dmse"] = slope([m["mse"] for m in mlist])
+    mean["dcos"] = slope([m["cos"] for m in mlist])
+    return mean
+
+
+def _decide_tiers_calibrated_plus(stats, candidates, preset, layer_params):
+    """Per-layer tier assignment from measured metrics, cost-aware.
+
+    Gates per tier: Rel-RMSE, cos-sim, worst per-channel relative RMSE
+    (2.5x the layer gate — catches localized channel damage), and MSE drift
+    (rising error compounds over real step counts -> promote a tier).
+
+    Small-layer polish: layers under ~0.3% of total candidate params whose
+    int4 margin is mediocre are promoted to full INT8, capped at 2% of total
+    params — near-free quality for almost no VRAM/speed cost.
+
+    Returns (int8_keys, int8mm_keys); every other candidate runs int4 matmul.
+    """
+    rel44, cos44, rel48, cos48 = _CALIB_PLUS_PRESETS[preset]
+    ch44, ch48 = 2.5 * rel44, 2.5 * rel48
+    int8_keys, int8mm_keys = set(), set()
+    total_params = max(1, sum(layer_params.values()))
+
+    logging.info(
+        f"INT4 Mixed Save: calibrated+ preset '{preset}' gates: "
+        f"int4mm relRMSE<={rel44} cos>={cos44} chrel<={ch44:.3f} | "
+        f"int8mm relRMSE<={rel48} cos>={cos48} chrel<={ch48:.3f}"
+    )
+    logging.info(
+        "INT4 Mixed Save: per-layer metrics below are int4mm | int8mm | int8, "
+        "each 'rel/snr/cos' = Rel-RMSE / SNR dB / cosine-similarity vs bf16."
+    )
+
+    polish_pool = []  # (int4 rel margin severity, key) for small-layer polish
+
+    for key, _rot in sorted(candidates):
+        rec = stats.get(key)
+        if not rec or not rec["tiers"]["int4mm"]:
+            int8_keys.add(key)
+            logging.info(f"calibrated+  int8    {key}  (no activation samples — safe default)")
+            continue
+
+        m44 = _mean_and_drift(rec["tiers"]["int4mm"])
+        m48 = _mean_and_drift(rec["tiers"]["int8mm"])
+        m8 = _mean_and_drift(rec["tiers"]["int8"])
+        n = rec["n"]
+
+        # Drift promotion: rising MSE that would grow to a large fraction of
+        # the mean over the measured window means the tier degrades over steps.
+        drift44 = m44["dmse"] > 0 and m44["dmse"] * n > 0.5 * m44["mse"]
+        drift48 = m48["dmse"] > 0 and m48["dmse"] * n > 0.5 * m48["mse"]
+
+        pass44 = (m44["rel"] <= rel44 and m44["cos"] >= cos44
+                  and m44["chrel"] <= ch44 and not drift44)
+        pass48 = (m48["rel"] <= rel48 and m48["cos"] >= cos48
+                  and m48["chrel"] <= ch48 and not drift48)
+
+        if pass44:
+            tier = "int4mm"
+            # Mediocre margin on a tiny layer -> candidate for INT8 polish.
+            if (layer_params.get(key, 0) / total_params < 0.003
+                    and m44["rel"] > 0.5 * rel44):
+                polish_pool.append((m44["rel"] / rel44, key))
+        elif pass48:
+            tier = "int8mm"
+            int8mm_keys.add(key)
+        else:
+            tier = "int8"
+            int8_keys.add(key)
+
+        note = " [drift-promoted]" if (tier != "int4mm" and drift44) or (tier == "int8" and drift48) else ""
+        logging.info(
+            f"calibrated+  {tier:7s} {key}  "
+            f"rel {m44['rel']:.3f}/{m48['rel']:.3f}/{m8['rel']:.3f}  "
+            f"snr {m44['snr']:.1f}/{m48['snr']:.1f}/{m8['snr']:.1f}dB  "
+            f"cos {m44['cos']:.4f}/{m48['cos']:.4f}/{m8['cos']:.4f}  "
+            f"mae {m44['mae']:.4f}  max {m44['max']:.3f}  outl {m44['outl']*100:.2f}%  "
+            f"chrel {m44['chrel']:.3f}  dMSE/step {m44['dmse']:+.2e}  "
+            f"dCos/step {m44['dcos']:+.2e}  (n={n}){note}"
+        )
+
+    # Small-layer polish: promote the worst-margin tiny layers to INT8 until
+    # the 2%-of-params budget is spent.
+    polish_pool.sort(reverse=True)
+    budget = 0.02 * total_params
+    spent = 0
+    for _sev, key in polish_pool:
+        cost = layer_params.get(key, 0)
+        if spent + cost > budget:
+            continue
+        spent += cost
+        int8_keys.add(key)
+        int8mm_keys.discard(key)
+        logging.info(f"calibrated+  int8    {key}  [small-layer polish: near-free quality]")
+
+    n_int4 = len(candidates) - len(int8_keys) - len(int8mm_keys)
+    int8_params = sum(layer_params.get(k, 0) for k in int8_keys)
+    logging.info(
+        f"INT4 Mixed Save: calibrated+ decisions — {n_int4} int4mm, "
+        f"{len(int8mm_keys)} int8mm, {len(int8_keys)} int8 "
+        f"(effective int8_ratio {len(int8_keys)/max(1,len(candidates)):.2f} by count, "
+        f"{int8_params/total_params:.2f} by params; "
+        f"int8mm_ratio {len(int8mm_keys)/max(1,len(candidates)):.2f})"
+    )
+    return int8_keys, int8mm_keys
+
+
 class INT4W4A4MixedSave:
     """Offline converter: bf16/fp16 diffusion model -> native ComfyUI
     convrot_w4a4 + int8_tensorwise mixed checkpoint."""
@@ -268,7 +571,8 @@ class INT4W4A4MixedSave:
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "High-precision (bf16/fp16/fp32) source model to convert."}),
                 "model_type": (list(MODEL_TYPE_EXCLUSIONS.keys()), {"tooltip": "Selects which sensitive layers (embedders, modulation, final layers) are kept at source precision."}),
                 "int8_ratio": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of quantizable linear layers kept at INT8 (W8A8) instead of INT4. 0.20 reproduces the paper's 'INT W4A4 +20% 8bit Mixed' setting."}),
-                "selection": (["structural", "calibrated", "sensitivity", "random"], {"default": "structural", "tooltip": "How the INT8 subset is chosen. 'structural': first/last blocks + attention-out/MLP-down projections, ends-inward (recommended, no calibration). 'calibrated': short sampling pass measuring per-layer INT4 activation error — requires the calib_* inputs. 'sensitivity': weight-only INT4 error. 'random': paper's random subset."}),
+                "selection": (["structural", "calibrated", "calibrated+", "sensitivity", "random"], {"default": "structural", "tooltip": "How the INT8 subset is chosen. 'structural': first/last blocks + attention-out/MLP-down projections, ends-inward (no calibration). 'calibrated': short sampling pass ranking layers by INT4 activation error, sliced by the ratio widgets. 'calibrated+': measures every layer's actual output error (MSE/Rel-RMSE/SNR/cos-sim vs bf16) under all three tiers and assigns each layer the cheapest acceptable tier per the calibrated_plus_preset — IGNORES int8_ratio, int8_mm_ratio and linear_dtype. Both calibrated modes need the calib_* inputs. 'sensitivity': weight-only INT4 error. 'random': paper's random subset."}),
+                "calibrated_plus_preset": (["Balanced", "BalancedQ", "BalancedS", "Quality", "QualityQ", "QualityS"], {"default": "Balanced", "tooltip": "Error-threshold preset for 'calibrated+'. Quality bases are ~2x stricter than Balanced (more INT8, better fidelity). Q variants tighten thresholds (quality-leaning), S variants loosen them (speed/size-leaning). Ignored for other selection modes."}),
                 "linear_dtype": (["int4", "int8"], {"default": "int4", "tooltip": "Matmul dtype for the W4A4 layers. int4 uses int4 tensor cores where supported (fastest); int8 does the matrix multiplication in int8 — activations are quantized to 8 bits instead of 4, much higher quality at the same 4-bit storage."}),
                 "int8_mm_ratio": ("FLOAT", {"default": 0.30, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Middle tier: fraction of layers that stay 4-bit storage but run the matmul in int8 (linear_dtype=int8). Applied to the next-most-sensitive layers after the full-INT8 subset. Ignored when linear_dtype is already int8."}),
                 "convrot_groupsize": (["256", "1024", "64"], {"default": "256", "tooltip": "Regular Hadamard rotation group size (power of 4). Falls back per-layer to the largest divisor of in_features."}),
@@ -294,7 +598,8 @@ class INT4W4A4MixedSave:
 
     def convert(self, unet_name, model_type, int8_ratio, selection, linear_dtype,
                 convrot_groupsize, int8_convrot, seed, filename_prefix,
-                int8_mm_ratio=0.30, calib_steps=4, calib_cfg=3.0, calib_model=None,
+                int8_mm_ratio=0.30, calibrated_plus_preset="Balanced",
+                calib_steps=4, calib_cfg=3.0, calib_model=None,
                 calib_positive=None, calib_negative=None, calib_latent=None):
         QuantizedTensor, native_ok = _native_w4a4_support()
         if not native_ok:
@@ -369,55 +674,76 @@ class INT4W4A4MixedSave:
         if not candidates:
             raise RuntimeError("INT4 Mixed Save: no quantizable linear layers found.")
 
-        # ---- Pass 2: rank layers most-sensitive-first, slice into tiers ------
-        # Tier 1 (worst):        int8_tensorwise            (int8_ratio)
-        # Tier 2 (next worst):   convrot_w4a4 + int8 matmul (int8_mm_ratio)
-        # Tier 3 (rest):         convrot_w4a4 + int4 matmul
-        n_int8 = max(0, min(int(round(int8_ratio * len(candidates))), len(candidates)))
-
-        if selection == "random":
-            gen = torch.Generator().manual_seed(seed)
-            order = torch.randperm(len(candidates), generator=gen).tolist()
-            ranked_keys = [candidates[i][0] for i in order]
-        elif selection == "structural":
-            struct = _structural_scores(candidates)
-            ranked_keys = [k for k, _ in sorted(candidates, key=lambda c: (-struct[c[0]], c[0]))]
-        elif selection == "calibrated":
+        # ---- Pass 2: assign tiers ---------------------------------------------
+        # calibrated+ : per-layer measured decisions (ignores the ratio widgets)
+        # other modes : rank most-sensitive-first, slice by the ratio widgets
+        #   Tier 1 (worst):        int8_tensorwise            (int8_ratio)
+        #   Tier 2 (next worst):   convrot_w4a4 + int8 matmul (int8_mm_ratio)
+        #   Tier 3 (rest):         convrot_w4a4 + int4 matmul
+        if selection == "calibrated+":
             if any(x is None for x in (calib_model, calib_positive, calib_negative, calib_latent)):
                 raise RuntimeError(
-                    "INT4 Mixed Save: 'calibrated' selection needs calib_model, "
-                    "calib_positive, calib_negative and calib_latent connected. "
-                    "Load the same checkpoint with the stock 'Load Diffusion Model' "
-                    "node and wire it in, or switch selection to 'structural'."
+                    "INT4 Mixed Save: 'calibrated+' needs calib_model, calib_positive, "
+                    "calib_negative and calib_latent connected. Load the same checkpoint "
+                    "with the stock 'Load Diffusion Model' node and wire it in."
                 )
-            act_err = _calibrate_activation_errors(
+            logging.info(
+                "INT4 Mixed Save: calibrated+ active — int8_ratio, int8_mm_ratio and "
+                "linear_dtype widgets are ignored; tiers come from measured error."
+            )
+            stats = _calibrate_tier_metrics(
                 calib_model, calib_positive, calib_negative, calib_latent,
                 calib_steps, calib_cfg, seed, dict(candidates),
             )
-            observed = sorted(act_err.values())
-            fallback = observed[len(observed) // 2] if observed else 1.0
-            scores = []
-            for key, rot_gs in candidates:
-                w_err = _w4a4_sensitivity(sd[key], rot_gs, device)
-                scores.append((act_err.get(key, fallback) * w_err, key))
-            scores.sort(reverse=True)
-            ranked_keys = [k for _, k in scores]
-            worst = ", ".join(ranked_keys[:min(8, max(1, n_int8))])
-            logging.info(f"INT4 Mixed Save: calibration ranking (worst first): {worst} ...")
-        else:  # sensitivity (weight-only)
-            logging.info(f"INT4 Mixed Save: scoring {len(candidates)} layers for INT4 sensitivity...")
-            scores = []
-            for key, rot_gs in candidates:
-                scores.append((_w4a4_sensitivity(sd[key], rot_gs, device), key))
-            scores.sort(reverse=True)
-            ranked_keys = [k for _, k in scores]
-
-        int8_keys = set(ranked_keys[:n_int8])
-        if linear_dtype == "int8":
-            int8mm_keys = set(ranked_keys[n_int8:])  # global override: all W4A4 use int8 mm
+            layer_params = {key: sd[key].numel() for key, _ in candidates}
+            int8_keys, int8mm_keys = _decide_tiers_calibrated_plus(
+                stats, candidates, calibrated_plus_preset, layer_params)
         else:
-            n_mm = max(0, min(int(round(int8_mm_ratio * len(candidates))), len(candidates) - n_int8))
-            int8mm_keys = set(ranked_keys[n_int8:n_int8 + n_mm])
+            n_int8 = max(0, min(int(round(int8_ratio * len(candidates))), len(candidates)))
+
+            if selection == "random":
+                gen = torch.Generator().manual_seed(seed)
+                order = torch.randperm(len(candidates), generator=gen).tolist()
+                ranked_keys = [candidates[i][0] for i in order]
+            elif selection == "structural":
+                struct = _structural_scores(candidates)
+                ranked_keys = [k for k, _ in sorted(candidates, key=lambda c: (-struct[c[0]], c[0]))]
+            elif selection == "calibrated":
+                if any(x is None for x in (calib_model, calib_positive, calib_negative, calib_latent)):
+                    raise RuntimeError(
+                        "INT4 Mixed Save: 'calibrated' selection needs calib_model, "
+                        "calib_positive, calib_negative and calib_latent connected. "
+                        "Load the same checkpoint with the stock 'Load Diffusion Model' "
+                        "node and wire it in, or switch selection to 'structural'."
+                    )
+                act_err = _calibrate_activation_errors(
+                    calib_model, calib_positive, calib_negative, calib_latent,
+                    calib_steps, calib_cfg, seed, dict(candidates),
+                )
+                observed = sorted(act_err.values())
+                fallback = observed[len(observed) // 2] if observed else 1.0
+                scores = []
+                for key, rot_gs in candidates:
+                    w_err = _w4a4_sensitivity(sd[key], rot_gs, device)
+                    scores.append((act_err.get(key, fallback) * w_err, key))
+                scores.sort(reverse=True)
+                ranked_keys = [k for _, k in scores]
+                worst = ", ".join(ranked_keys[:min(8, max(1, n_int8))])
+                logging.info(f"INT4 Mixed Save: calibration ranking (worst first): {worst} ...")
+            else:  # sensitivity (weight-only)
+                logging.info(f"INT4 Mixed Save: scoring {len(candidates)} layers for INT4 sensitivity...")
+                scores = []
+                for key, rot_gs in candidates:
+                    scores.append((_w4a4_sensitivity(sd[key], rot_gs, device), key))
+                scores.sort(reverse=True)
+                ranked_keys = [k for _, k in scores]
+
+            int8_keys = set(ranked_keys[:n_int8])
+            if linear_dtype == "int8":
+                int8mm_keys = set(ranked_keys[n_int8:])  # global override: all W4A4 use int8 mm
+            else:
+                n_mm = max(0, min(int(round(int8_mm_ratio * len(candidates))), len(candidates) - n_int8))
+                int8mm_keys = set(ranked_keys[n_int8:n_int8 + n_mm])
 
         # ---- Pass 3: quantize -------------------------------------------------
         out_sd = {}
@@ -482,6 +808,7 @@ class INT4W4A4MixedSave:
             "int8_ratio": int8_ratio,
             "int8_mm_ratio": int8_mm_ratio,
             "selection": selection,
+            "calibrated_plus_preset": calibrated_plus_preset if selection == "calibrated+" else None,
             "linear_dtype": linear_dtype,
             "convrot_groupsize": requested_gs,
             "w4a4_int4mm_layers": n_w4a4 - n_w4a4_i8mm,
