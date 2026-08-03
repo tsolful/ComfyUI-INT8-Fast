@@ -695,6 +695,36 @@ class INT4W4A4MixedSave:
             del donor_sd
             if isinstance(donor_metadata, dict) and donor_metadata:
                 metadata = {**(metadata if isinstance(metadata, dict) else {}), **donor_metadata}
+
+            # CRITICAL: ComfyUI's H3 detection reads adaln_curve_grid and
+            # time_embed_dim from the table SHAPE, but a "config" JSON in the
+            # metadata OVERRIDES that afterwards. The full bf16 model's config
+            # (time_embed_dim 2688) would rebuild full-width adaln against the
+            # curve-form tensors -> size mismatch on adaln_t_table at load.
+            # Patch the transformer config to the curve form taken from the
+            # donor table's actual shape.
+            table_key = next((k for k in sd if "adaln_t_table" in k), None)
+            if isinstance(metadata, dict) and "config" in metadata and table_key is not None:
+                try:
+                    conf_json = json.loads(metadata["config"])
+                    tr = conf_json.get("transformer", {})
+                    tshape = sd[table_key].shape
+                    tr["adaln_curve_grid"] = int(tshape[0])
+                    tr["time_embed_dim"] = int(tshape[1])
+                    for stale in ("timestep_input_dim", "time_embed_hidden_size"):
+                        tr.pop(stale, None)
+                    conf_json["transformer"] = tr
+                    metadata["config"] = json.dumps(conf_json)
+                    logging.info(
+                        f"INT4 Mixed Save: patched config metadata for curve-form adaln "
+                        f"(grid {int(tshape[0])}, basis {int(tshape[1])})."
+                    )
+                except Exception as e:
+                    logging.warning(
+                        f"INT4 Mixed Save: could not patch config metadata ({e}); "
+                        "removing it so shape-based detection applies instead."
+                    )
+                    metadata.pop("config", None)
             if not dropped or copied == 0:
                 raise RuntimeError(
                     "INT4 Mixed Save: pruned-donor merge matched nothing — the source "
