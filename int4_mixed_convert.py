@@ -570,6 +570,7 @@ class INT4W4A4MixedSave:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "High-precision (bf16/fp16/fp32) source model to convert."}),
                 "model_type": (list(MODEL_TYPE_EXCLUSIONS.keys()), {"tooltip": "Selects which sensitive layers (embedders, modulation, final layers) are kept at source precision."}),
+                "prune_donor": (["None"] + folder_paths.get_filename_list("diffusion_models"), {"default": "None", "tooltip": "MiniMax H3 pruned conversion: select the existing *_pruned_* checkpoint. Its adaln curve table + basis-form adaln weights and metadata are merged into the output, and the source's full-width modulation + time_embedder weights (~13B params) are dropped. Leave on None for every other model."}),
                 "int8_ratio": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of quantizable linear layers kept at INT8 (W8A8) instead of INT4. 0.20 reproduces the paper's 'INT W4A4 +20% 8bit Mixed' setting."}),
                 "selection": (["structural", "calibrated", "calibrated+", "sensitivity", "random"], {"default": "structural", "tooltip": "How the INT8 subset is chosen. 'structural': first/last blocks + attention-out/MLP-down projections, ends-inward (no calibration). 'calibrated': short sampling pass ranking layers by INT4 activation error, sliced by the ratio widgets. 'calibrated+': measures every layer's actual output error (MSE/Rel-RMSE/SNR/cos-sim vs bf16) under all three tiers and assigns each layer the cheapest acceptable tier per the calibrated_plus_preset — IGNORES int8_ratio, int8_mm_ratio and linear_dtype. Both calibrated modes need the calib_* inputs. 'sensitivity': weight-only INT4 error. 'random': paper's random subset."}),
                 "calibrated_plus_preset": (["Balanced", "BalancedQ", "BalancedS", "Quality", "QualityQ", "QualityS"], {"default": "Balanced", "tooltip": "Error-threshold preset for 'calibrated+'. Quality bases are ~2x stricter than Balanced (more INT8, better fidelity). Q variants tighten thresholds (quality-leaning), S variants loosen them (speed/size-leaning). Ignored for other selection modes."}),
@@ -598,7 +599,7 @@ class INT4W4A4MixedSave:
 
     def convert(self, unet_name, model_type, int8_ratio, selection, linear_dtype,
                 convrot_groupsize, int8_convrot, seed, filename_prefix,
-                int8_mm_ratio=0.30, calibrated_plus_preset="Balanced",
+                prune_donor="None", int8_mm_ratio=0.30, calibrated_plus_preset="Balanced",
                 calib_steps=4, calib_cfg=3.0, calib_model=None,
                 calib_positive=None, calib_negative=None, calib_latent=None):
         QuantizedTensor, native_ok = _native_w4a4_support()
@@ -657,6 +658,54 @@ class INT4W4A4MixedSave:
             raise RuntimeError(
                 "INT4 Mixed Save: source model already contains quantized layers. "
                 "Select the original high-precision (bf16/fp16) checkpoint."
+            )
+
+        # ---- Pass 0.5: pruned-donor merge (MiniMax H3 style) ------------------
+        # The pruned H3 checkpoints re-parameterize AdaLN: the ~13B full-width
+        # modulation weights + time_embedder are replaced by a precomputed
+        # adaln_t_table curve basis and small basis-form adaln_proj weights.
+        # Those never change with quantization, so we drop the full-width
+        # tensors from the bf16 source and take the curve tensors + the config
+        # metadata straight from the existing pruned checkpoint.
+        if prune_donor and prune_donor != "None":
+            donor_path = folder_paths.get_full_path("diffusion_models", prune_donor)
+            donor_sd, donor_metadata = comfy.utils.load_torch_file(donor_path, return_metadata=True)
+            if not any("adaln_t_table" in k for k in donor_sd):
+                raise RuntimeError(
+                    "INT4 Mixed Save: prune_donor has no 'adaln_t_table' — select a "
+                    "*pruned* checkpoint (e.g. minimax_h3_*_pruned_int8_convrot)."
+                )
+            drop_patterns = ("adaln_proj", "time_embedder")
+            copy_patterns = ("adaln_proj", "adaln_t_table", "time_embedder")
+            dropped = [k for k in sd if any(p in k for p in drop_patterns)]
+            for k in dropped:
+                del sd[k]
+            copied = 0
+            for k in list(donor_sd.keys()):
+                if not any(p in k for p in copy_patterns):
+                    continue
+                sd[k] = donor_sd[k]
+                copied += 1
+                if k.endswith(".weight"):
+                    base = k[:-len(".weight")]
+                    for side in (".comfy_quant", ".weight_scale"):
+                        if base + side in donor_sd:
+                            sd[base + side] = donor_sd[base + side]
+                            copied += 1
+            del donor_sd
+            if isinstance(donor_metadata, dict) and donor_metadata:
+                metadata = {**(metadata if isinstance(metadata, dict) else {}), **donor_metadata}
+            if not dropped or copied == 0:
+                raise RuntimeError(
+                    "INT4 Mixed Save: pruned-donor merge matched nothing — the source "
+                    f"dropped {len(dropped)} tensors and the donor supplied {copied}. "
+                    "Check that source is the full bf16 and donor the pruned checkpoint "
+                    "of the SAME variant (fl2va vs ref2va)."
+                )
+            logging.info(
+                f"INT4 Mixed Save: pruned-donor merge — dropped {len(dropped)} full-width "
+                f"modulation/time-embedder tensors from the source, copied {copied} curve "
+                f"tensors + metadata from '{prune_donor}'."
             )
 
         # ---- Pass 1: collect candidates -------------------------------------
@@ -809,6 +858,7 @@ class INT4W4A4MixedSave:
             "int8_mm_ratio": int8_mm_ratio,
             "selection": selection,
             "calibrated_plus_preset": calibrated_plus_preset if selection == "calibrated+" else None,
+            "prune_donor": prune_donor if prune_donor != "None" else None,
             "linear_dtype": linear_dtype,
             "convrot_groupsize": requested_gs,
             "w4a4_int4mm_layers": n_w4a4 - n_w4a4_i8mm,
