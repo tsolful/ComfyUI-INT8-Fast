@@ -86,6 +86,7 @@ try:
     from .int8_lora import INT8GroupedLora
     from .int8_save import INT8ModelSave
     from .int4_mixed_convert import INT4W4A4MixedSave
+    from .w4a8_mixed_convert import W4A8MixedSave
 
     NODE_CLASS_MAPPINGS = {
         "OTUNetLoaderW8A8": UNetLoaderINTW8A8,
@@ -93,6 +94,7 @@ try:
         "INT8ModelSave": INT8ModelSave,
         "INT8PreLoraLoader": PreLoraLoader,
         "INT4W4A4MixedSave": INT4W4A4MixedSave,
+        "W4A8MixedSave": W4A8MixedSave,
     }
 
     NODE_DISPLAY_NAME_MAPPINGS = {
@@ -101,6 +103,7 @@ try:
         "INT8ModelSave": "Save Int8 Model",
         "INT8PreLoraLoader": "INT8 Pre-Lora Loader",
         "INT4W4A4MixedSave": "Convert INT4 W4A4 + 20% INT8 Mixed (Native)",
+        "W4A8MixedSave": "Convert W4A8 Codebook + INT8 Mixed (Kitchen PR90)",
     }
 except ImportError as e:
     logging.error(f"Int88: Failed to import nodes: {e}")
