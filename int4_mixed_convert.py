@@ -305,13 +305,18 @@ def _output_metrics(y, ref):
 
 
 @torch.no_grad()
-def _tier_sim_metrics(x, w, rot_gs):
+def _tier_sim_metrics(x, w, rot_gs, w6_group=None):
     """Simulate all three tiers for one linear on real activations.
 
     x: (tokens, in) float32; w: (out, in) float32, same device.
     Tiers: int8 (per-row W8 + per-token A8), int8mm (group-64 W4 + A8),
     int4mm (group-64 W4 + group-64 A4). Weight is processed in row chunks to
     bound memory. Returns {"int8": {...}, "int8mm": {...}, "int4mm": {...}}.
+
+    ``w6_group`` (optional) adds a "w6a8" tier: symmetric uniform 6-bit weights
+    (levels -32..31) per ``w6_group`` columns + A8 — the kitchen W6A8 format
+    (PR #191) minus its grid-aware scale search, i.e. a slightly conservative
+    proxy.
     """
     device = x.device
     H = build_hadamard(rot_gs, device=device, dtype=torch.float32) if rot_gs else None
@@ -330,6 +335,8 @@ def _tier_sim_metrics(x, w, rot_gs):
     y8 = torch.empty_like(y_ref)
     y48 = torch.empty_like(y_ref)
     y44 = torch.empty_like(y_ref)
+    do_w6 = bool(w6_group) and in_f % int(w6_group) == 0
+    y68 = torch.empty_like(y_ref) if do_w6 else None
 
     chunk = max(256, (1 << 24) // max(in_f * 4, 1))  # ~16MB fp32 of W rows
     for r0 in range(0, out_f, chunk):
@@ -347,17 +354,27 @@ def _tier_sim_metrics(x, w, rot_gs):
         y8[:, r0:r0 + chunk] = xa8 @ w8.T
         y48[:, r0:r0 + chunk] = xa8 @ w4.T
         y44[:, r0:r0 + chunk] = xa4 @ w4.T
+        if do_w6:
+            G6 = int(w6_group)
+            gw6 = wr.view(wr.shape[0], in_f // G6, G6)
+            s6 = gw6.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 31.0
+            w6 = (gw6 / s6).round_().clamp_(-32, 31).mul_(s6).view(wr.shape[0], in_f)
+            y68[:, r0:r0 + chunk] = xa8 @ w6.T
+            del gw6, w6
         del wc, wr, w8, gw, w4
 
-    return {
+    out = {
         "int8": _output_metrics(y8, y_ref),
         "int8mm": _output_metrics(y48, y_ref),
         "int4mm": _output_metrics(y44, y_ref),
     }
+    if do_w6:
+        out["w6a8"] = _output_metrics(y68, y_ref)
+    return out
 
 
 def _calibrate_tier_metrics(model, positive, negative, latent, steps, cfg, seed,
-                            candidate_map):
+                            candidate_map, w6_group=None):
     """calibrated+ measurement pass: hooks simulate all three tiers per layer
     on real activations during a short sampling run.
 
@@ -374,7 +391,7 @@ def _calibrate_tier_metrics(model, positive, negative, latent, steps, cfg, seed,
             if not isinstance(x, torch.Tensor):
                 return
             rec = stats.setdefault(
-                key, {"n": 0, "tiers": {"int8": [], "int8mm": [], "int4mm": []}})
+                key, {"n": 0, "tiers": {"int8": [], "int8mm": [], "int4mm": [], "w6a8": []}})
             if rec["n"] >= _CALIB_PLUS_MAX_SIMS:
                 return
             w = getattr(module, "weight", None)
@@ -386,7 +403,7 @@ def _calibrate_tier_metrics(model, positive, negative, latent, steps, cfg, seed,
                     x2 = x2[:_CALIB_PLUS_TOKENS]
                 x2 = x2.float()
                 wf = w.to(device=x2.device, dtype=torch.float32)
-                res = _tier_sim_metrics(x2, wf, rot_gs)
+                res = _tier_sim_metrics(x2, wf, rot_gs, w6_group=w6_group)
                 del wf
             except Exception as e:
                 logging.debug(f"INT4 Mixed Save: calibrated+ sim failed for {key}: {e}")

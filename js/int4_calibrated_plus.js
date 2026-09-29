@@ -1,8 +1,8 @@
 // Shows the calibrated_plus_preset dropdown only when selection == "calibrated+"
-// on the "Convert INT4 W4A4 + 20% INT8 Mixed (Native)" node.
+// on the INT4 W4A4, W4A8 and W6A8 mixed converter nodes.
 import { app } from "../../scripts/app.js";
 
-const NODE_CLASS = "INT4W4A4MixedSave";
+const NODE_CLASSES = new Set(["INT4W4A4MixedSave", "W4A8MixedSave", "W6A8MixedSave"]);
 const SELECTION_WIDGET = "selection";
 const PRESET_WIDGET = "calibrated_plus_preset";
 
@@ -28,7 +28,7 @@ function setVisible(node, widget, show) {
 app.registerExtension({
     name: "INT8Fast.CalibratedPlusPreset",
     nodeCreated(node) {
-        if (node.comfyClass !== NODE_CLASS) return;
+        if (!NODE_CLASSES.has(node.comfyClass)) return;
         const sel = node.widgets?.find((w) => w.name === SELECTION_WIDGET);
         const preset = node.widgets?.find((w) => w.name === PRESET_WIDGET);
         if (!sel || !preset) return;
