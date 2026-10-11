@@ -1,8 +1,8 @@
 // Shows the calibrated_plus_preset dropdown only when selection == "calibrated+"
-// on the INT4 W4A4, W4A8 and W6A8 mixed converter nodes.
+// on the INT4 W4A4 mixed converter node.
 import { app } from "../../scripts/app.js";
 
-const NODE_CLASSES = new Set(["INT4W4A4MixedSave", "W4A8MixedSave", "W6A8MixedSave"]);
+const NODE_CLASSES = new Set(["INT4W4A4MixedSave"]);
 const SELECTION_WIDGET = "selection";
 const PRESET_WIDGET = "calibrated_plus_preset";
 
