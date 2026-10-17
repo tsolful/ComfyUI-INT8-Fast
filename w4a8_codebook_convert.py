@@ -163,6 +163,48 @@ def _build_plan(reader, donor, model_type, fmt, format_name, group, label):
     return plan, metadata
 
 
+_BLOCK_RE = re.compile(r"^(.*?)\.(\d+)\.")
+
+
+def _apply_w6_tail(plan, n_last, group6, label):
+    """Mixed W4A8/W6A8: switch the grouped layers of the last n_last blocks of
+    the main block stack (the dotted prefix with the most numbered blocks,
+    e.g. 'layers' / 'single_blocks') to W6A8. Returns the number switched."""
+    if n_last <= 0:
+        return 0
+    if group6 < 16 or group6 % 16:
+        raise RuntimeError(f"{label}: w6a8_group_size must be a multiple of 16.")
+    stacks = {}
+    for e in plan:
+        if e["action"] == "grouped":
+            m = _BLOCK_RE.match(e["out_base"])
+            if m:
+                stacks.setdefault(m.group(1), set()).add(int(m.group(2)))
+    if not stacks:
+        logging.warning(f"{label}: w6a8_last_blocks set but no numbered block stack found — all W4A8.")
+        return 0
+    prefix = max(stacks, key=lambda p: len(stacks[p]))
+    idx = sorted(stacks[prefix])
+    tail = set(idx[-n_last:])
+    n6 = skipped = 0
+    for e in plan:
+        if e["action"] != "grouped":
+            continue
+        m = _BLOCK_RE.match(e["out_base"])
+        if not (m and m.group(1) == prefix and int(m.group(2)) in tail):
+            continue
+        sp = e["spec"]
+        if sp["k"] % group6:
+            skipped += 1
+            continue
+        e["spec"] = grouped_spec(FORMAT_W6A8, FORMAT_W6A8, sp["k"], sp["n"], group6)
+        n6 += 1
+    logging.info(f"{label}: mixed layout — {n6} layers in '{prefix}' blocks {min(tail)}-{max(tail)} "
+                 f"({len(tail)} of {len(idx)}) use W6A8 g{group6}, the rest W4A8"
+                 + (f" ({skipped} kept W4A8: K not divisible by {group6})" if skipped else "") + ".")
+    return n6
+
+
 def _sample(model, positive, negative, latent, steps, cfg, seed):
     """One plain euler/simple sampling run (calibration / tracking driver)."""
     import comfy.sample
@@ -332,7 +374,7 @@ class _DiffusionGroupedBase:
 
     @classmethod
     def _inputs(cls, group_choices, group_default, extra, default_format, default_prefix,
-                video=False):
+                video=False, mixed=False):
         req = {
             "unet_name": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "High-precision (bf16/fp16) source model."}),
             "model_type": (list(MODEL_TYPE_EXCLUSIONS.keys()), {"tooltip": "Sensitive layers kept at source precision."}),
@@ -363,6 +405,9 @@ class _DiffusionGroupedBase:
             "calib_samples": ("INT", {"default": 1, "min": 1, "max": 16, "tooltip": "GPTQ: sampling runs per prompt (seeds calib_seed, +1, ...)."}),
             "calib_prompts": ("STRING", {"default": "", "multiline": True, "tooltip": "Multi-prompt calibration (needs calib_clip). Separate prompts with a line containing only ---; blank lines stay inside a prompt. Each prompt runs calib_samples x calib_steps. calib_positive, if connected, is used as an extra first prompt. Timestep tracking uses the first prompt."}),
         })
+        if mixed:
+            req["w6a8_last_blocks"] = ("INT", {"default": 0, "min": 0, "max": 512, "tooltip": "Mixed W4A8/W6A8: the last N transformer blocks of the main block stack use W6A8 (0 = all W4A8). The last blocks carry most of the quantization error; e.g. MOSS (42 blocks): 12 roughly halves W4 output error for ~12% more file, 18 gets close to all-W6A8."})
+            req["w6a8_group_size"] = (["16", "32", "64"], {"default": "16", "tooltip": "Group size of the W6A8 blocks (16 = 6.5 bits/weight, lowest error)."})
         calib = {
             "calib_model": ("MODEL", {"tooltip": "The SAME checkpoint (bf16, or fp8 weights for very large models). Needed for gptq and weights+timesteps."}),
             "calib_latent": ("LATENT", {"tooltip": "Empty latent at the resolution (and frame count) you will generate at."}),
@@ -382,7 +427,8 @@ class _DiffusionGroupedBase:
              calib_steps, calib_cfg, calib_seed, calib_model, calib_positive,
              calib_negative, calib_latent, method="rtn", gptq_damp=0.01, gptq_act_order=True,
              gptq_sequential=True, gptq_max_tokens=4096, gptq_budget_gb=4.0, gptq_holdout=False,
-             calib_samples=1, bits=None, label=None, calib_clip=None, calib_prompts=""):
+             calib_samples=1, bits=None, label=None, calib_clip=None, calib_prompts="",
+             w6a8_last_blocks=0, w6a8_group_size="16"):
         bits = bits or self.BITS
         fmt = FORMAT_W4A8 if bits == 4 else FORMAT_W6A8
         label = label or ("W4A8 Codebook" if bits == 4 else "W6A8")
@@ -397,6 +443,11 @@ class _DiffusionGroupedBase:
         donor = (SourceReader(folder_paths.get_full_path("diffusion_models", prune_donor))
                  if prune_donor and prune_donor != "None" else None)
         plan, metadata = _build_plan(reader, donor, model_type, fmt, format_name, group, label)
+
+        n_w6 = _apply_w6_tail(plan, int(w6a8_last_blocks) if bits == 4 else 0,
+                              int(w6a8_group_size), label)
+        if n_w6:
+            label = f"{label} + W6A8 tail"
 
         src_bytes = sum(reader.itemsize(k) * int(torch.Size(reader.shape(k)).numel()) for k in reader.keys)
         print_plan(plan, label, 1 if s_dtype != torch.float32 else 4, src_bytes)
@@ -431,7 +482,7 @@ class _DiffusionGroupedBase:
             logging.warning(f"{label}: weights+timesteps needs calib_model, calib_latent and a prompt — "
                             "falling back to weight error only.")
             want_ts = False
-        kitchen = kitchen_support(bits)
+        kitchen = kitchen_support(6 if n_w6 else bits)
 
         full_folder, filename, counter, _sub, _pref = folder_paths.get_save_image_path(
             filename_prefix, self.output_dir)
@@ -476,6 +527,8 @@ class _DiffusionGroupedBase:
                   "scale_search": bool(scale_search) if bits == 6 else None,
                   "prune_donor": prune_donor if donor is not None else None,
                   "method": method, "gptq": gptq_summary,
+                  "w6a8_last_blocks": int(w6a8_last_blocks) if n_w6 else 0,
+                  "w6a8_layers": n_w6, "w6a8_group_size": int(w6a8_group_size) if n_w6 else None,
                   "measure_error": measure_error, "layers": records}
 
         if want_ts:
@@ -513,7 +566,7 @@ class W4A8CodebookSave(_DiffusionGroupedBase):
     def INPUT_TYPES(cls):
         return cls._inputs(["16", "32", "64"], "16", {
             "codebook": ("BOOLEAN", {"default": True, "tooltip": "Per-tensor Lloyd-Max 16-level codebook (recommended)."}),
-        }, FORMAT_W4A8, "int4_models/W4A8")
+        }, FORMAT_W4A8, "int4_models/W4A8", mixed=True)
 
     def convert(self, unet_name, model_type, prune_donor, group_size, scale_dtype, codebook,
                 convrot_groupsize, format_name, measure_error, dry_run, filename_prefix,
@@ -561,7 +614,7 @@ class VideoGPTQSave(_DiffusionGroupedBase):
             "format": (["w4a8_codebook", "w6a8"], {"default": "w4a8_codebook"}),
             "codebook": ("BOOLEAN", {"default": True, "tooltip": "W4A8 only: Lloyd-Max 16-level codebook."}),
             "scale_search": ("BOOLEAN", {"default": True, "tooltip": "W6A8 only: grid-aware group-scale search."}),
-        }, "auto", "video_models/GPTQ", video=True)
+        }, "auto", "video_models/GPTQ", video=True, mixed=True)
 
     def convert(self, unet_name, model_type, prune_donor, group_size, scale_dtype, format, codebook,
                 scale_search, convrot_groupsize, format_name, measure_error, dry_run,
