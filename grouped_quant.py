@@ -311,6 +311,19 @@ def unpack_codes(packed, k, bits):
     return codes
 
 
+def pack_codes(codes, bits):
+    """Exact inverse of unpack_codes: unsigned codes [n, k] -> uint8 [n, k*bits/8]."""
+    c = codes.to(torch.int32)
+    n, k = c.shape
+    lo = c & 0x0F
+    nib = (lo[:, 0::2] | (lo[:, 1::2] << 4)).to(torch.uint8)
+    if bits == 4:
+        return nib.contiguous()
+    top = ((c >> 4) & 0x3).reshape(n, k // 4, 4)
+    hi = (top[..., 0] | (top[..., 1] << 2) | (top[..., 2] << 4) | (top[..., 3] << 6)).to(torch.uint8)
+    return torch.cat([nib, hi], dim=1).contiguous()
+
+
 @torch.no_grad()
 def decode_grouped(parts, k, bits, group, device, rotated=False, rows=None):
     """Flattened grouped parts -> float32 weight [n, k] (original basis unless
@@ -513,6 +526,7 @@ class StreamingSafetensorsWriter:
         self._f = open(self.spill_path, "wb")
         self.entries = []
         self.names = set()
+        self._index = {}
         self.pos = 0
 
     def add(self, name, tensor):
@@ -532,8 +546,23 @@ class StreamingSafetensorsWriter:
             for o in range(0, nbytes, self._COPY_CHUNK):
                 self._f.write(mv[o:o + self._COPY_CHUNK])
         self.entries.append((name, st, list(t.shape), self.pos, nbytes, t.element_size()))
+        self._index[name] = self.entries[-1]
         self.names.add(name)
         self.pos += nbytes
+
+    def get(self, name):
+        """Read back a tensor already written to the spill file (GPTQ sequential
+        passes fake-quantize finished layers without keeping them in RAM)."""
+        _n, st, shape, off, nbytes, _isz = self._index[name]
+        self._f.flush()
+        with open(self.spill_path, "rb") as f:
+            f.seek(off)
+            buf = bytearray(f.read(nbytes))
+        if len(buf) != nbytes:
+            raise RuntimeError(f"spill read short for {name}")
+        if nbytes == 0:
+            return torch.empty(shape, dtype=_ST2TORCH[st])
+        return torch.frombuffer(buf, dtype=torch.uint8).view(_ST2TORCH[st]).reshape(shape)
 
     def finalize(self, metadata=None):
         self._f.close()
@@ -632,18 +661,35 @@ def print_plan(plan, label, scale_dtype_bytes, src_bytes):
 
 
 def execute_plan(plan, writer, device, label, conf_style, kitchen=None, grouped_opts=None,
-                 measure_weights=False):
+                 measure_weights=False, prequant=None, decoder_ok=None):
     """Run a plan: stream every source tensor through its action into the
-    writer. Returns (qmeta_layers, weight_records, specs_by_base, decoder_ok)."""
+    writer. Returns (qmeta_layers, weight_records, specs_by_base, decoder_ok).
+    prequant: {base: {"records": {...}}} for layers already quantized and
+    written (GPTQ) — only their conf / spec / records are added here."""
     import comfy.utils
     opts = grouped_opts or {}
+    prequant = prequant or {}
     pbar = comfy.utils.ProgressBar(len(plan))
     qmeta, records, specs = {}, {}, {}
-    decoder_ok = None
-    n_int8 = n_grp = 0
+    n_int8 = n_grp = n_pre = 0
     for e in plan:
-        src = e["reader"].get(e["src_key"])
         act = e["action"]
+        if act not in ("copy", "bf16") and e.get("out_base") in prequant:
+            base = e["out_base"]
+            spec = e["spec"]
+            conf = quant_conf(spec)
+            if conf_style == "tensor":
+                writer.add(f"{base}.comfy_quant", conf_tensor(conf))
+            else:
+                qmeta[base] = conf
+            specs[base] = dict(spec, src_key=e["src_key"], reader=e["reader"], shape=tuple(e["shape"]))
+            rec = prequant[base].get("records")
+            if rec:
+                records.setdefault(base, {}).update(rec)
+            n_pre += 1
+            pbar.update(1)
+            continue
+        src = e["reader"].get(e["src_key"])
         if act in ("copy", "bf16"):
             writer.add(e["out_key"], src)
             del src
@@ -689,13 +735,53 @@ def execute_plan(plan, writer, device, label, conf_style, kitchen=None, grouped_
         pbar.update(1)
         if device.type == "cuda" and (n_int8 + n_grp) % 16 == 0:
             torch.cuda.empty_cache()
-    logging.info(f"{label}: quantized {n_grp} grouped + {n_int8} int8 layers.")
+    logging.info(f"{label}: quantized {n_grp} grouped + {n_int8} int8 layers (RTN)"
+                 + (f", {n_pre} layers by GPTQ." if n_pre else "."))
     return qmeta, records, specs, (decoder_ok is not False)
 
 
 # =============================================================================
 # Fake-quant calibration session (runtime-faithful A8 + decoded weights)
 # =============================================================================
+
+class comfy_compiler_off:
+    """Disable ComfyUI's model compiler (aimdo malloc graph) and CUDA graphs
+    while calibration hooks run: the compiler records each block's allocation
+    pattern and replays it, so hooks that allocate (Hessians, fake-quant
+    outputs) inside a block make the replay abort the process."""
+
+    def __enter__(self):
+        self.saved = None
+        try:
+            from comfy.cli_args import args
+            self.saved = (getattr(args, "disable_comfy_compiler", False),
+                          getattr(args, "disable_cuda_graphs", False))
+            args.disable_comfy_compiler = True
+            args.disable_cuda_graphs = True
+            self._cleanup()
+        except Exception:
+            pass
+        return self
+
+    @staticmethod
+    def _cleanup():
+        try:
+            import comfy.model_prefetch as mp
+            if hasattr(mp, "cleanup_malloc_graph"):
+                mp.cleanup_malloc_graph()
+        except Exception:
+            pass
+
+    def __exit__(self, *exc):
+        if self.saved is not None:
+            try:
+                from comfy.cli_args import args
+                args.disable_comfy_compiler, args.disable_cuda_graphs = self.saved
+            except Exception:
+                pass
+        self._cleanup()
+        return False
+
 
 def _suffix_score(a, b):
     s = 0
@@ -758,9 +844,15 @@ class FakeQuantSession:
     embeddings by decoded int8 rows, fused expert banks by decoded weights.
     Reference passes (quant=False) accumulate the diagonal Hessian E[x_rot^2]."""
 
-    def __init__(self, out_path, specs, decoder_ok=True):
-        self.out = SourceReader(out_path)
-        self._out_keys = set(self.out.keys)
+    _PART_CACHE_BYTES = 2 << 30
+
+    def __init__(self, out_path, specs, decoder_ok=True, part_source=None):
+        # part_source: a StreamingSafetensorsWriter whose spill file holds the
+        # layers quantized so far (GPTQ sequential passes); else the final file.
+        self.out = part_source if part_source is not None else SourceReader(out_path)
+        self._live = part_source is not None
+        self._out_keys = None if self._live else set(self.out.keys)
+        self._part_cache, self._part_cache_bytes = {}, 0
         self.specs = specs
         self.decoder_ok = decoder_ok
         self.quant = False
@@ -778,11 +870,20 @@ class FakeQuantSession:
         sp = self.specs[base]
         names = (["weight", "weight_scale"] if sp["format"] == FORMAT_INT8 else
                  ["weight", "weight_s_rel", "weight_s_channel", "weight_codebook"])
+        cached = self._part_cache.get(base)
+        if cached is not None:
+            return cached
+        keys = self.out.names if self._live else self._out_keys
         out = {}
         for n in names:
             key = f"{base}.{n}"
-            if key in self._out_keys:
+            if key in keys:
                 out[n] = self.out.get(key)
+        if self._live:
+            nb = sum(t.numel() * t.element_size() for t in out.values())
+            if self._part_cache_bytes + nb <= self._PART_CACHE_BYTES:
+                self._part_cache[base] = out
+                self._part_cache_bytes += nb
         return out
 
     def usable(self, base):

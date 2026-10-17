@@ -86,7 +86,7 @@ try:
     from .int8_lora import INT8GroupedLora
     from .int8_save import INT8ModelSave
     from .int4_mixed_convert import INT4W4A4MixedSave
-    from .w4a8_codebook_convert import W4A8CodebookSave, W6A8Save
+    from .w4a8_codebook_convert import W4A8CodebookSave, W6A8Save, VideoGPTQSave
     from .te_quant_convert import TextEncoderQuantSave
 
     NODE_CLASS_MAPPINGS = {
@@ -97,6 +97,7 @@ try:
         "INT4W4A4MixedSave": INT4W4A4MixedSave,
         "W4A8CodebookSave": W4A8CodebookSave,
         "W6A8Save": W6A8Save,
+        "VideoGPTQSave": VideoGPTQSave,
         "TextEncoderQuantSave": TextEncoderQuantSave,
     }
 
@@ -108,6 +109,7 @@ try:
         "INT4W4A4MixedSave": "Convert INT4 W4A4 + 20% INT8 Mixed (Native)",
         "W4A8CodebookSave": "Convert W4A8 Codebook (Kitchen)",
         "W6A8Save": "Convert W6A8 (Kitchen)",
+        "VideoGPTQSave": "Convert Video GPTQ W4A8 / W6A8 (Experimental)",
         "TextEncoderQuantSave": "Convert Text Encoder / LLM (INT8 / W4A8 / W6A8 ConvRot)",
     }
 except ImportError as e:

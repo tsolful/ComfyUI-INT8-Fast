@@ -28,11 +28,19 @@ Error measurement (report only):
                      Tracks the prediction-noise variance per timestep,
                      per-layer local error per step, and the diagonal
                      Hessian used to weight each layer's weight distance.
+
+method = gptq (needs the calib_* inputs): sampling runs with the connected
+model collect each layer's input Hessian, then GPTQ re-chooses the codes
+with error feedback (same file format — see gptq_quant.py). Sequential by
+default: later passes see the already-quantized layers. The experimental
+video node (VideoGPTQSave) is the same pipeline with video defaults
+(token subsampling, stronger dampening, held-out validation per layer).
 """
 
 import json
 import logging
 import os
+import re
 
 import torch
 import torch.nn.functional as F
@@ -47,9 +55,10 @@ from .grouped_quant import (
     FORMAT_W4A8, FORMAT_W6A8, GROUPED_BITS,
     kitchen_support, grouped_spec, int8_spec,
     SourceReader, StreamingSafetensorsWriter,
-    print_plan, execute_plan, map_modules, FakeQuantSession,
+    print_plan, execute_plan, map_modules, FakeQuantSession, comfy_compiler_off,
     summarize_local, log_summary, write_report,
 )
+from .gptq_quant import run_gptq, estimate as gptq_estimate
 
 
 _FLOAT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
@@ -154,11 +163,86 @@ def _build_plan(reader, donor, model_type, fmt, format_name, group, label):
     return plan, metadata
 
 
+def _sample(model, positive, negative, latent, steps, cfg, seed):
+    """One plain euler/simple sampling run (calibration / tracking driver)."""
+    import comfy.sample
+    latent_img = latent["samples"]
+    if hasattr(comfy.sample, "fix_empty_latent_channels"):
+        latent_img = comfy.sample.fix_empty_latent_channels(model, latent_img)
+    noise = comfy.sample.prepare_noise(latent_img, seed)
+    comfy.sample.sample(model, noise, steps, cfg, "euler", "simple", positive, negative,
+                        latent_img, denoise=1.0, seed=seed, disable_pbar=True)
+
+
+_PROMPT_SEP = re.compile(r"(?m)^[ \t]*-{3,}[ \t]*$")
+
+
+def _split_prompts(text):
+    """Prompts separated by a line containing only '---' (blank lines stay
+    inside a prompt, so multi-paragraph prompts work)."""
+    return [p.strip() for p in _PROMPT_SEP.split(text or "") if p.strip()]
+
+
+def _cond_to_cpu(cond):
+    out = []
+    for c, d in cond:
+        d2 = {k: (v.cpu() if torch.is_tensor(v) else v) for k, v in d.items()}
+        out.append([c.cpu() if torch.is_tensor(c) else c, d2])
+    return out
+
+
+def _cond_tokens(cond):
+    try:
+        return int(cond[0][0].shape[1])
+    except Exception:
+        return -1
+
+
+def _encode(clip, text):
+    """Same as the stock CLIPTextEncode node; result kept on CPU."""
+    tokens = clip.tokenize(text)
+    if hasattr(clip, "encode_from_tokens_scheduled"):
+        cond = clip.encode_from_tokens_scheduled(tokens)
+    else:
+        c, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+        cond = [[c, {"pooled_output": pooled}]]
+    return _cond_to_cpu(cond)
+
+
+def _resolve_conds(label, clip, prompts, positive, negative, cfg):
+    """-> (list of positive conditionings, negative). calib_positive (if
+    connected) comes first, then every calib_prompts entry encoded with
+    calib_clip. Missing negative: empty prompt via calib_clip."""
+    positives = [positive] if positive is not None else []
+    if prompts:
+        if clip is None:
+            logging.warning(f"{label}: calib_prompts given but calib_clip is not connected — "
+                            "prompts ignored.")
+        else:
+            for p in prompts:
+                positives.append(_encode(clip, p))
+            logging.info(f"{label}: encoded {len(prompts)} calibration prompt(s), text tokens "
+                         f"{[_cond_tokens(c) for c in positives]}.")
+    if negative is None and positives:
+        if clip is not None:
+            negative = _encode(clip, "")
+            n_tok = _cond_tokens(negative)
+            logging.info(f"{label}: calib_negative not connected — using an empty prompt "
+                         f"({n_tok} text tokens).")
+            if n_tok == 0:
+                negative = _encode(clip, " ")
+        else:
+            negative = positives[0]
+            if cfg > 1.0:
+                logging.warning(f"{label}: no calib_negative / calib_clip — using the positive as "
+                                "negative (the CFG branch is then not representative).")
+    return positives, negative
+
+
 def _track_timesteps(session, specs2d, calib_model, positive, negative, latent,
                      steps, cfg, seed, label):
     """Teacher-forced sampling: every model call runs reference + fake-quant on
     the same input; returns per-call noise-variance records and the sigma map."""
-    import comfy.sample
     dm = calib_model.model.diffusion_model
     mapping = map_modules(dm, specs2d, want="linear")
     hooked = session.install_linear(mapping)
@@ -201,12 +285,8 @@ def _track_timesteps(session, specs2d, calib_model, positive, negative, latent,
     m = calib_model.clone()
     m.set_model_unet_function_wrapper(wrapper)
     try:
-        latent_img = latent["samples"]
-        if hasattr(comfy.sample, "fix_empty_latent_channels"):
-            latent_img = comfy.sample.fix_empty_latent_channels(m, latent_img)
-        noise = comfy.sample.prepare_noise(latent_img, seed)
-        comfy.sample.sample(m, noise, steps, cfg, "euler", "simple", positive, negative,
-                            latent_img, denoise=1.0, seed=seed, disable_pbar=True)
+        with comfy_compiler_off():
+            _sample(m, positive, negative, latent, steps, cfg, seed)
     finally:
         session.remove()
     return records, {v: k for k, v in sig_index.items()}
@@ -251,7 +331,8 @@ class _DiffusionGroupedBase:
         self.output_dir = folder_paths.get_output_directory()
 
     @classmethod
-    def _inputs(cls, group_choices, group_default, extra, default_format, default_prefix):
+    def _inputs(cls, group_choices, group_default, extra, default_format, default_prefix,
+                video=False):
         req = {
             "unet_name": (folder_paths.get_filename_list("diffusion_models"), {"tooltip": "High-precision (bf16/fp16) source model."}),
             "model_type": (list(MODEL_TYPE_EXCLUSIONS.keys()), {"tooltip": "Sensitive layers kept at source precision."}),
@@ -266,24 +347,46 @@ class _DiffusionGroupedBase:
             "measure_error": (["weights", "off", "weights+timesteps"], {"default": "weights", "tooltip": "weights: per-layer weight error (no extra inputs). weights+timesteps: also a short teacher-forced sampling run with the calib_* inputs — per-step noise variance, per-layer per-step error, Hessian-weighted distances."}),
             "dry_run": ("BOOLEAN", {"default": False, "tooltip": "Print the per-layer plan and projected size, write nothing."}),
             "filename_prefix": ("STRING", {"default": default_prefix}),
-            "calib_steps": ("INT", {"default": 4, "min": 1, "max": 50, "tooltip": "Sampling steps for timestep tracking."}),
-            "calib_cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+            "calib_steps": ("INT", {"default": 8 if video else 4, "min": 1, "max": 50, "tooltip": "Sampling steps per calibration / tracking run (GPTQ collects inputs at every step)."}),
+            "calib_cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1, "tooltip": "Use the model's normal CFG (e.g. MOSS base 3.0). CFG > 1 also calibrates the negative branch."}),
             "calib_seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffff}),
         })
-        return {"required": req, "optional": {
-            "calib_model": ("MODEL", {"tooltip": "For weights+timesteps: the SAME checkpoint loaded in high precision."}),
-            "calib_positive": ("CONDITIONING",),
-            "calib_negative": ("CONDITIONING",),
-            "calib_latent": ("LATENT",),
-        }}
+        if not video:
+            req["method"] = (["rtn", "gptq"], {"default": "rtn", "tooltip": "rtn: round-to-nearest (no calibration). gptq: Hessian-aware error feedback (arXiv:2210.17323) — lower output error, same file format; needs calib_model/positive/negative/latent."})
+        req.update({
+            "gptq_damp": ("FLOAT", {"default": 0.03 if video else 0.01, "min": 0.0001, "max": 1.0, "step": 0.001, "tooltip": "Dampening as a fraction of the mean Hessian diagonal. Raise (0.03-0.1) if results look over-fitted."}),
+            "gptq_act_order": ("BOOLEAN", {"default": True, "tooltip": "Quantize the most-used input columns first (static groups keep the format exact)."}),
+            "gptq_sequential": ("BOOLEAN", {"default": True, "tooltip": "Later calibration passes run with the already-quantized layers (paper's sequential mode). Off = one pass when the budget allows, slightly less accurate."}),
+            "gptq_max_tokens": ("INT", {"default": 2048 if video else 4096, "min": 128, "max": 65536, "step": 128, "tooltip": "Random tokens per layer per model call used for the Hessian (bounds memory/time for large latents)."}),
+            "gptq_budget_gb": ("FLOAT", {"default": 4.0, "min": 0.5, "max": 64.0, "step": 0.5, "tooltip": "VRAM for Hessians per calibration pass. Smaller = more passes. 16 GB cards: 3-4."}),
+            "gptq_holdout": ("BOOLEAN", {"default": bool(video), "tooltip": "Alternate model calls form a held-out Hessian; a layer where GPTQ is worse than RTN on it keeps RTN (doubles Hessian memory)."}),
+            "calib_samples": ("INT", {"default": 1, "min": 1, "max": 16, "tooltip": "GPTQ: sampling runs per prompt (seeds calib_seed, +1, ...)."}),
+            "calib_prompts": ("STRING", {"default": "", "multiline": True, "tooltip": "Multi-prompt calibration (needs calib_clip). Separate prompts with a line containing only ---; blank lines stay inside a prompt. Each prompt runs calib_samples x calib_steps. calib_positive, if connected, is used as an extra first prompt. Timestep tracking uses the first prompt."}),
+        })
+        calib = {
+            "calib_model": ("MODEL", {"tooltip": "The SAME checkpoint (bf16, or fp8 weights for very large models). Needed for gptq and weights+timesteps."}),
+            "calib_latent": ("LATENT", {"tooltip": "Empty latent at the resolution (and frame count) you will generate at."}),
+        }
+        cond = {
+            "calib_positive": ("CONDITIONING", {"tooltip": "Optional single prompt (or use calib_prompts + calib_clip)."}),
+            "calib_negative": ("CONDITIONING", {"tooltip": "Optional; defaults to an empty prompt encoded with calib_clip."}),
+            "calib_clip": ("CLIP", {"tooltip": "Text encoder for calib_prompts (the one you generate with)."}),
+        }
+        if video:
+            req.update(calib)
+            return {"required": req, "optional": cond}
+        return {"required": req, "optional": {**calib, **cond}}
 
     def _run(self, unet_name, model_type, prune_donor, group_size, scale_dtype, codebook,
              scale_search, format_name, measure_error, dry_run, filename_prefix,
              calib_steps, calib_cfg, calib_seed, calib_model, calib_positive,
-             calib_negative, calib_latent):
-        bits = self.BITS
+             calib_negative, calib_latent, method="rtn", gptq_damp=0.01, gptq_act_order=True,
+             gptq_sequential=True, gptq_max_tokens=4096, gptq_budget_gb=4.0, gptq_holdout=False,
+             calib_samples=1, bits=None, label=None, calib_clip=None, calib_prompts=""):
+        bits = bits or self.BITS
         fmt = FORMAT_W4A8 if bits == 4 else FORMAT_W6A8
-        label = "W4A8 Codebook" if bits == 4 else "W6A8"
+        label = label or ("W4A8 Codebook" if bits == 4 else "W6A8")
+        gptq = method == "gptq"
         group = int(group_size)
         if bits == 6 and (group < 16 or group % 16 != 0):
             raise RuntimeError(f"{label}: group_size must be a multiple of 16, got {group}.")
@@ -297,26 +400,67 @@ class _DiffusionGroupedBase:
 
         src_bytes = sum(reader.itemsize(k) * int(torch.Size(reader.shape(k)).numel()) for k in reader.keys)
         print_plan(plan, label, 1 if s_dtype != torch.float32 else 4, src_bytes)
+        gptq_specs = {e["out_base"]: dict(e["spec"], src_key=e["src_key"], reader=e["reader"],
+                                          shape=tuple(e["shape"]))
+                      for e in plan if e["action"] in ("grouped", "int8") and len(e["shape"]) == 2}
+        prompts = _split_prompts(calib_prompts)
+        n_prompts = len(prompts) * (calib_clip is not None) + (calib_positive is not None)
+        if gptq:
+            tot, npass = gptq_estimate(gptq_specs, gptq_budget_gb, gptq_holdout)
+            logging.info(f"{label}: GPTQ estimate — {len(gptq_specs)} layers, <= {tot / 2**30:.1f} GiB of "
+                         f"Hessians, <= {npass} calibration pass(es), each {n_prompts} prompt(s) x "
+                         f"{calib_samples} seed(s) x {calib_steps} steps, budget {gptq_budget_gb} GiB "
+                         f"(shared q/k/v inputs lower this).")
         if dry_run:
             logging.info(f"{label}: dry run — nothing written.")
             return {}
 
-        kitchen = kitchen_support(bits)
         want_ts = measure_error == "weights+timesteps"
-        if want_ts and any(x is None for x in (calib_model, calib_positive, calib_negative, calib_latent)):
-            logging.warning(f"{label}: weights+timesteps needs calib_model/positive/negative/latent — "
+        positives, negative = [], None
+        if (gptq or want_ts) and calib_model is not None and calib_latent is not None:
+            positives, negative = _resolve_conds(label, calib_clip, prompts, calib_positive,
+                                                 calib_negative, calib_cfg)
+            if calib_clip is not None and prompts:
+                # Text encoder done: unload it before the diffusion model is loaded.
+                comfy.model_management.unload_all_models()
+                comfy.model_management.soft_empty_cache()
+        if gptq and not positives:
+            raise RuntimeError(f"{label}: method=gptq needs calib_model, calib_latent and a prompt "
+                               "(calib_positive, or calib_prompts + calib_clip).")
+        if want_ts and not positives:
+            logging.warning(f"{label}: weights+timesteps needs calib_model, calib_latent and a prompt — "
                             "falling back to weight error only.")
             want_ts = False
+        kitchen = kitchen_support(bits)
 
         full_folder, filename, counter, _sub, _pref = folder_paths.get_save_image_path(
             filename_prefix, self.output_dir)
         out_path = os.path.join(full_folder, f"{filename}_{counter:05}_.safetensors")
         writer = StreamingSafetensorsWriter(out_path)
+        gopts = {"scale_dtype": s_dtype, "codebook": codebook, "scale_search": scale_search}
+        gptq_summary = None
         try:
+            prequant, pre_dec = {}, None
+            if gptq:
+                mapping = map_modules(calib_model.model.diffusion_model, gptq_specs, want="linear")
+                logging.info(f"{label}: GPTQ — {len(mapping)}/{len(gptq_specs)} layers matched in calib_model")
+                if not mapping:
+                    raise RuntimeError(f"{label}: no calib_model layers matched — connect the SAME model.")
+
+                def run_pass():
+                    for pos in positives:
+                        for s in range(int(calib_samples)):
+                            _sample(calib_model, pos, negative, calib_latent,
+                                    calib_steps, calib_cfg, calib_seed + s)
+                prequant, pre_dec, gptq_summary = run_gptq(
+                    label, gptq_specs, mapping, run_pass, writer, kitchen, gopts, device,
+                    damp=gptq_damp, act_order=gptq_act_order, sequential=gptq_sequential,
+                    max_tokens=gptq_max_tokens, budget_gb=gptq_budget_gb, holdout=gptq_holdout,
+                    seed=calib_seed, measure_weights=measure_error != "off")
             qmeta, records, specs, decoder_ok = execute_plan(
                 plan, writer, device, label, conf_style="header", kitchen=kitchen,
-                grouped_opts={"scale_dtype": s_dtype, "codebook": codebook, "scale_search": scale_search},
-                measure_weights=measure_error != "off")
+                grouped_opts=gopts, measure_weights=measure_error != "off",
+                prequant=prequant, decoder_ok=pre_dec)
             metadata["_quantization_metadata"] = json.dumps({"layers": dict(sorted(qmeta.items()))})
             writer.finalize(metadata)
         except BaseException:
@@ -331,6 +475,7 @@ class _DiffusionGroupedBase:
                   "codebook": bool(codebook) if bits == 4 else None,
                   "scale_search": bool(scale_search) if bits == 6 else None,
                   "prune_donor": prune_donor if donor is not None else None,
+                  "method": method, "gptq": gptq_summary,
                   "measure_error": measure_error, "layers": records}
 
         if want_ts:
@@ -338,7 +483,7 @@ class _DiffusionGroupedBase:
                 session = FakeQuantSession(out_path, specs, decoder_ok)
                 specs2d = {b: s for b, s in specs.items() if len(s["shape"]) == 2}
                 ts_records, step_sigma = _track_timesteps(
-                    session, specs2d, calib_model, calib_positive, calib_negative, calib_latent,
+                    session, specs2d, calib_model, positives[0], negative, calib_latent,
                     calib_steps, calib_cfg, calib_seed, label)
                 report["timesteps"] = _log_timesteps(label, ts_records)
                 for base, s in summarize_local(session.local).items():
@@ -373,11 +518,11 @@ class W4A8CodebookSave(_DiffusionGroupedBase):
     def convert(self, unet_name, model_type, prune_donor, group_size, scale_dtype, codebook,
                 convrot_groupsize, format_name, measure_error, dry_run, filename_prefix,
                 calib_steps=4, calib_cfg=1.0, calib_seed=0, calib_model=None,
-                calib_positive=None, calib_negative=None, calib_latent=None):
+                calib_positive=None, calib_negative=None, calib_latent=None, **gptq):
         return self._run(unet_name, model_type, prune_donor, group_size, scale_dtype, codebook,
                          True, format_name, measure_error, dry_run, filename_prefix,
                          calib_steps, calib_cfg, calib_seed, calib_model, calib_positive,
-                         calib_negative, calib_latent)
+                         calib_negative, calib_latent, **gptq)
 
 
 class W6A8Save(_DiffusionGroupedBase):
@@ -395,8 +540,42 @@ class W6A8Save(_DiffusionGroupedBase):
     def convert(self, unet_name, model_type, prune_donor, group_size, scale_dtype, scale_search,
                 convrot_groupsize, format_name, measure_error, dry_run, filename_prefix,
                 calib_steps=4, calib_cfg=1.0, calib_seed=0, calib_model=None,
-                calib_positive=None, calib_negative=None, calib_latent=None):
+                calib_positive=None, calib_negative=None, calib_latent=None, **gptq):
         return self._run(unet_name, model_type, prune_donor, group_size, scale_dtype, False,
                          scale_search, format_name, measure_error, dry_run, filename_prefix,
                          calib_steps, calib_cfg, calib_seed, calib_model, calib_positive,
-                         calib_negative, calib_latent)
+                         calib_negative, calib_latent, **gptq)
+
+
+class VideoGPTQSave(_DiffusionGroupedBase):
+    """EXPERIMENTAL: GPTQ for video diffusion models (W4A8 codebook / W6A8)."""
+    DESCRIPTION = ("EXPERIMENTAL GPTQ conversion for video models. Same file format as the W4A8 / W6A8 "
+                   "nodes. Video defaults: token subsampling, stronger dampening, 8 calibration steps "
+                   "and a held-out check that keeps RTN for any layer GPTQ makes worse. Calibrate at "
+                   "the resolution and frame count you generate at. Multi-prompt: calib_prompts "
+                   "separated by --- lines + calib_clip.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return cls._inputs(["auto", "16", "32", "64"], "auto", {
+            "format": (["w4a8_codebook", "w6a8"], {"default": "w4a8_codebook"}),
+            "codebook": ("BOOLEAN", {"default": True, "tooltip": "W4A8 only: Lloyd-Max 16-level codebook."}),
+            "scale_search": ("BOOLEAN", {"default": True, "tooltip": "W6A8 only: grid-aware group-scale search."}),
+        }, "auto", "video_models/GPTQ", video=True)
+
+    def convert(self, unet_name, model_type, prune_donor, group_size, scale_dtype, format, codebook,
+                scale_search, convrot_groupsize, format_name, measure_error, dry_run,
+                filename_prefix, calib_steps, calib_cfg, calib_seed, calib_model,
+                calib_latent, calib_positive=None, calib_negative=None, **gptq):
+        bits = 4 if format == "w4a8_codebook" else 6
+        if group_size == "auto":
+            group_size = "16" if bits == 4 else "32"
+        if not format_name or format_name == "auto":
+            format_name = FORMAT_W4A8 if bits == 4 else FORMAT_W6A8
+        logging.warning("Video GPTQ is EXPERIMENTAL — compare against the RTN conversion before use.")
+        return self._run(unet_name, model_type, prune_donor, group_size, scale_dtype,
+                         codebook if bits == 4 else False, scale_search if bits == 6 else True,
+                         format_name, measure_error, dry_run, filename_prefix,
+                         calib_steps, calib_cfg, calib_seed, calib_model, calib_positive,
+                         calib_negative, calib_latent, method="gptq", bits=bits,
+                         label=f"Video GPTQ {'W4A8' if bits == 4 else 'W6A8'}", **gptq)

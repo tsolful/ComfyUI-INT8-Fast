@@ -35,6 +35,11 @@ Error measurement (report only):
                           weight distances (diagonal E[x^2] from the
                           reference pass) and perplexity of the prompts
                           through lm_head (reference vs quantized).
+
+method = gptq (needs calib_clip): the calibration text (calib_prompts plus
+an optional built-in multi-domain corpus) is encoded to collect each
+layer's input Hessian, then GPTQ re-chooses the codes (gptq_quant.py).
+Fused MoE expert banks and embeddings stay RTN.
 """
 
 import logging
@@ -51,9 +56,10 @@ from .grouped_quant import (
     FORMAT_INT8, FORMAT_W4A8, FORMAT_W6A8,
     kitchen_support, grouped_spec, int8_spec, rotate_rows,
     SourceReader, StreamingSafetensorsWriter,
-    print_plan, execute_plan, map_modules, FakeQuantSession,
+    print_plan, execute_plan, map_modules, FakeQuantSession, comfy_compiler_off,
     summarize_local, log_summary, write_report,
 )
+from .gptq_quant import run_gptq, estimate as gptq_estimate
 
 _FLOAT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -74,6 +80,53 @@ _DEFAULT_PROMPTS = (
     "A photograph of a red fox standing in fresh snow at sunrise, soft golden light.\n"
     "Explain in two sentences why the sky appears blue during the day.\n"
     "A minimalist poster with the words SUMMER SALE in bold white letters on teal."
+)
+
+# Built-in GPTQ calibration corpus (original text, mixed domains and prompt
+# styles) so the Hessians see far more tokens than a few short prompts.
+_GPTQ_CORPUS = (
+    "A wide cinematic shot of a coastal town at dusk. Warm lights glow in the windows of white houses "
+    "stacked on a steep hillside, fishing boats rock gently in the harbor, and a lighthouse sweeps its "
+    "beam across low clouds tinted orange and violet. The water reflects every light in long, wavering "
+    "streaks, and a narrow stone staircase winds from the docks up to a small chapel with a blue dome.",
+    "Close-up portrait of an elderly woman with silver hair braided over one shoulder, deep laugh lines, "
+    "and bright hazel eyes. She wears a hand-knitted green sweater and holds a chipped ceramic mug of "
+    "tea. Soft window light from the left, shallow depth of field, 85mm lens, natural skin texture, "
+    "muted background of bookshelves slightly out of focus.",
+    "Isometric illustration of a tiny futuristic city on a floating island: glass towers, rooftop "
+    "gardens, magnetic trains looping between platforms, waterfalls pouring off the edges into the "
+    "clouds below. Clean vector style, pastel palette, crisp outlines, no text.",
+    "Product photo of a matte black wireless headphone on a polished concrete surface, studio lighting "
+    "with a soft key light and a thin rim light, subtle reflection, minimal composition, lots of "
+    "negative space on the right for copy, high detail on the stitched leather ear cushions.",
+    "Photosynthesis converts light energy into chemical energy. In the chloroplasts, chlorophyll absorbs "
+    "mostly red and blue light, and the energy splits water molecules, releasing oxygen. The captured "
+    "energy is stored in ATP and NADPH, which the Calvin cycle then uses to fix carbon dioxide into "
+    "sugars that the plant uses for growth and respiration.",
+    "def merge_sorted(a, b):\n    result, i, j = [], 0, 0\n    while i < len(a) and j < len(b):\n"
+    "        if a[i] <= b[j]:\n            result.append(a[i]); i += 1\n        else:\n"
+    "            result.append(b[j]); j += 1\n    return result + a[i:] + b[j:]\n"
+    "# Merges two sorted lists in linear time; used as the combine step of merge sort.",
+    "Le marché du samedi matin était plein de couleurs : des paniers de fraises, des fromages affinés, "
+    "du pain encore chaud. Ein alter Mann spielte Akkordeon an der Ecke, und Kinder liefen zwischen den "
+    "Ständen. 朝の市場はにぎやかで、魚屋の声が通りに響いていた。日落时，广场上的灯笼一盏一盏亮了起来。",
+    "A vintage travel poster in art deco style: a sleek streamlined locomotive crossing a stone viaduct "
+    "above a pine valley, bold geometric sun rays in the sky, large serif lettering at the top reading "
+    "NORTHERN EXPRESS and smaller text at the bottom reading DAILY DEPARTURES, limited palette of navy, "
+    "cream, and burnt orange.",
+    "Quarterly summary: revenue grew 12 percent year over year to 48.6 million, driven by subscription "
+    "renewals and two new enterprise contracts. Operating costs rose 7 percent, mainly from hiring in "
+    "engineering. Cash on hand is 31.2 million, and the team expects margins to improve in the second "
+    "half as infrastructure spending stabilizes.",
+    "An underwater scene in a kelp forest: shafts of sunlight cut through green-gold water, a curious "
+    "sea otter floats on its back cracking a shell on its chest, small silver fish dart between the "
+    "swaying stalks, and particles drift in the light. Photorealistic, high dynamic range.",
+    "Step by step: first preheat the oven to 200 degrees Celsius. Toss the diced potatoes with olive "
+    "oil, salt, smoked paprika and crushed garlic. Spread them in a single layer, roast for 35 minutes, "
+    "turning once halfway, until the edges are crisp and golden. Finish with chopped parsley and lemon.",
+    "Anime-style key visual: a girl with short teal hair and a yellow raincoat stands on a rooftop in "
+    "the rain, holding a transparent umbrella, neon signs of the city glowing below her, puddles "
+    "reflecting pink and blue light, dynamic low angle, detailed background, cel shading.",
 )
 
 
@@ -268,7 +321,8 @@ def _te_calibration(session, specs, plan, clip, prompts, device, label):
                 session.quant = quant
                 session.step = i
                 try:
-                    clip.encode_from_tokens(tokens)
+                    with comfy_compiler_off():
+                        clip.encode_from_tokens(tokens)
                 finally:
                     session.quant = False
                 run[quant] = (list(cap["ids"]), list(cap["h"]))
@@ -354,7 +408,15 @@ class TextEncoderQuantSave:
                 "measure_error": (["weights", "off", "weights+activations+ppl"], {"default": "weights", "tooltip": "weights+activations+ppl needs calib_clip and calib_prompts."}),
                 "dry_run": ("BOOLEAN", {"default": False, "tooltip": "Print the per-layer plan and projected size, write nothing."}),
                 "filename_prefix": ("STRING", {"default": "text_encoders/TE_quant"}),
-                "calib_prompts": ("STRING", {"default": _DEFAULT_PROMPTS, "multiline": True, "tooltip": "One prompt per line, used for activation error, Hessian and perplexity."}),
+                "calib_prompts": ("STRING", {"default": _DEFAULT_PROMPTS, "multiline": True, "tooltip": "One prompt per line, used for activation error, Hessian and perplexity (and GPTQ calibration)."}),
+                "method": (["rtn", "gptq"], {"default": "rtn", "tooltip": "gptq: Hessian-aware error feedback (arXiv:2210.17323), same file format; needs calib_clip. Expert banks / embeddings stay RTN."}),
+                "gptq_damp": ("FLOAT", {"default": 0.01, "min": 0.0001, "max": 1.0, "step": 0.001}),
+                "gptq_act_order": ("BOOLEAN", {"default": True}),
+                "gptq_sequential": ("BOOLEAN", {"default": True, "tooltip": "Later passes run with the already-quantized layers."}),
+                "gptq_max_tokens": ("INT", {"default": 4096, "min": 128, "max": 65536, "step": 128}),
+                "gptq_budget_gb": ("FLOAT", {"default": 4.0, "min": 0.5, "max": 64.0, "step": 0.5, "tooltip": "VRAM for Hessians per calibration pass."}),
+                "gptq_holdout": ("BOOLEAN", {"default": False, "tooltip": "Alternate texts form a held-out Hessian; layers where GPTQ is worse keep RTN."}),
+                "gptq_builtin_corpus": ("BOOLEAN", {"default": True, "tooltip": "Add a built-in multi-domain calibration corpus (~2k tokens) to calib_prompts for GPTQ. More text = better Hessians."}),
             },
             "optional": {
                 "calib_clip": ("CLIP", {"tooltip": "The SAME bf16 file loaded with the stock CLIP loader (activation / PPL measurement only)."}),
@@ -363,8 +425,11 @@ class TextEncoderQuantSave:
 
     def convert(self, clip_name, format, group_size, scale_dtype, codebook, scale_search, moe,
                 embeddings, vision_tower, measure_error, dry_run, filename_prefix, calib_prompts,
-                calib_clip=None):
+                calib_clip=None, method="rtn", gptq_damp=0.01, gptq_act_order=True,
+                gptq_sequential=True, gptq_max_tokens=4096, gptq_budget_gb=4.0, gptq_holdout=False,
+                gptq_builtin_corpus=True):
         label = "TE Quant"
+        gptq = method == "gptq"
         fmt = _FORMATS[format]
         group = int(group_size)
         if fmt == FORMAT_W6A8 and (group < 16 or group % 16 != 0):
@@ -376,9 +441,20 @@ class TextEncoderQuantSave:
         plan = _build_plan(reader, moe, embeddings, vision_tower, fmt, group, label)
         src_bytes = sum(reader.itemsize(k) * int(torch.Size(reader.shape(k)).numel()) for k in reader.keys)
         print_plan(plan, label, 1 if s_dtype != torch.float32 else 4, src_bytes)
+        gptq_specs = {e["out_base"]: dict(e["spec"], src_key=e["src_key"], reader=e["reader"],
+                                          shape=tuple(e["shape"]))
+                      for e in plan if e["action"] in ("grouped", "int8") and len(e["shape"]) == 2
+                      and not _EMBED_RE.search(e["out_base"])}
+        if gptq:
+            tot, npass = gptq_estimate(gptq_specs, gptq_budget_gb, gptq_holdout)
+            logging.info(f"{label}: GPTQ estimate — {len(gptq_specs)} layers, <= {tot / 2**30:.1f} GiB of "
+                         f"Hessians, <= {npass} calibration pass(es) at budget {gptq_budget_gb} GiB.")
         if dry_run:
             logging.info(f"{label}: dry run — nothing written.")
             return {}
+        if gptq and calib_clip is None:
+            raise RuntimeError(f"{label}: method=gptq needs calib_clip (the SAME bf16 file loaded "
+                               "with the stock CLIP loader).")
 
         has_grouped = any(e["action"] == "grouped" for e in plan)
         kitchen = kitchen_support(4 if fmt == FORMAT_W4A8 else 6) if has_grouped else None
@@ -393,11 +469,33 @@ class TextEncoderQuantSave:
             filename_prefix, self.output_dir)
         out_path = os.path.join(full_folder, f"{filename}_{counter:05}_.safetensors")
         writer = StreamingSafetensorsWriter(out_path)
+        gopts = {"scale_dtype": s_dtype, "codebook": codebook, "scale_search": scale_search}
+        gptq_summary = None
         try:
+            prequant, pre_dec = {}, None
+            if gptq:
+                root = calib_clip.cond_stage_model
+                mapping = map_modules(root, gptq_specs, want="linear")
+                logging.info(f"{label}: GPTQ — {len(mapping)}/{len(gptq_specs)} layers matched in calib_clip")
+                if not mapping:
+                    raise RuntimeError(f"{label}: no calib_clip layers matched — load the SAME file.")
+                texts = list(prompts) + (list(_GPTQ_CORPUS) if gptq_builtin_corpus else [])
+                if not texts:
+                    raise RuntimeError(f"{label}: GPTQ needs calib_prompts or gptq_builtin_corpus.")
+
+                def run_pass():
+                    for text in texts:
+                        tok = calib_clip.tokenize(text)
+                        calib_clip.encode_from_tokens(tok)
+                prequant, pre_dec, gptq_summary = run_gptq(
+                    label, gptq_specs, mapping, run_pass, writer, kitchen, gopts, device,
+                    damp=gptq_damp, act_order=gptq_act_order, sequential=gptq_sequential,
+                    max_tokens=gptq_max_tokens, budget_gb=gptq_budget_gb, holdout=gptq_holdout,
+                    seed=0, measure_weights=measure_error != "off")
             _qmeta, records, specs, decoder_ok = execute_plan(
                 plan, writer, device, label, conf_style="tensor", kitchen=kitchen,
-                grouped_opts={"scale_dtype": s_dtype, "codebook": codebook, "scale_search": scale_search},
-                measure_weights=measure_error != "off")
+                grouped_opts=gopts, measure_weights=measure_error != "off",
+                prequant=prequant, decoder_ok=pre_dec)
             writer.finalize(dict(reader.metadata) if reader.metadata else None)
         except BaseException:
             writer.abort()
@@ -409,6 +507,7 @@ class TextEncoderQuantSave:
         report = {"converter": label, "source": clip_name, "format": format, "group_size": group,
                   "scale_dtype": scale_dtype, "moe": bool(moe), "embeddings": embeddings,
                   "vision_tower": vision_tower, "measure_error": measure_error,
+                  "method": method, "gptq": gptq_summary,
                   "reasons": {e["src_key"]: e.get("reason") for e in plan if e.get("reason")},
                   "layers": records}
 
