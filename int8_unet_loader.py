@@ -65,6 +65,24 @@ MODEL_TYPE_EXCLUSIONS = {
         'time_embedder', 'token_refiner', 'adaln_proj',
         'final_layer', 'rope', 'adaln_t_table',
     ],
+    "flux3 klein": [
+        # FLUX.3 Image Klein, base and _sd_ (step-distilled flow-map) variants
+        # (comfy/ldm/flux3/model.py). Kept high precision: the latent/text
+        # input projections, timestep embedders (time_in also matches the
+        # distilled variant's ref_time_in), all adaLN modulations, final layer.
+        # Quantizable bulk: q/k/v_proj (or fused qkv), mlp_in, attn_out,
+        # mlp_out in content_mode_blocks, txt_mode_blocks and single_blocks.
+        'emb_in', 'txt_in', 'time_in',
+        'early_stream_modulations', 'single_stream_modulations', 'final_layer',
+    ],
+    "moss image": [
+        # MOSS-Image base / sft. Mirrors Comfy-Org's official int8_convrot
+        # files (header-verified): only layers.N.proj.{qkv,o,ffn_up_gate,
+        # ffn_down} are quantized; embedders, the text_embedder refiner
+        # blocks, shared/head modulations and the final projection stay bf16.
+        'video_embedder', 'text_embedder', 'time_embedding',
+        'shared_block_modulation', 'video_head_modulation', 'final_linear',
+    ],
     "ming image 0.1 design": [
         # Ming-Image-0.1-Design (and -Design-Layer) reuse the Z-Image / Lumina2
         # NextDiT key names (ComfyUI PR #16482: "Ming-Image: Z-Image keys"), so
@@ -104,7 +122,7 @@ class UNetLoaderINTW8A8:
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
                 "weight_dtype": (["default", "fp16", "bf16", "fp32"], {"tooltip": "INT8 compute dtype. Default follows the model dtype, but uses fp16 for RTX 20/T4 sm75 GPUs and fp32 for GTX 16/unknown sm75 GPUs. Manual values force that dtype."}),
-                "model_type": (["flux2", "z-image", "ideogram4", "chroma", "krea2", "wan", "ltx2", "minimax h3", "ming image 0.1 design", "qwen", "ernie", "anima", "hidream o1", "boogu"], {"tooltip": "Only used for on the fly quantization, to filter sensitive layers."}),
+                "model_type": (["flux2", "flux3 klein", "z-image", "ideogram4", "chroma", "krea2", "wan", "ltx2", "minimax h3", "ming image 0.1 design", "moss image", "qwen", "ernie", "anima", "hidream o1", "boogu"], {"tooltip": "Only used for on the fly quantization, to filter sensitive layers."}),
                 "on_the_fly_quantization": ("BOOLEAN", {"default": False, "tooltip": "Quantize a higher precision model to INT8. If the selected model is already INT8 keep unchecked."}),
                 "enable_convrot": ("BOOLEAN", {"default": True, "tooltip": "Enable ConvRot for better quantization. ~1.1x slower, but near-GGUF_Q8 quality."}),
                 "lora_mode": (["None", "Stochastic", "Dynamic"], {"default": "None", "tooltip": "None bakes LoRA patches with normal rounding which is the default behavior. Stochastic bakes with stochastic INT8 rounding, which can occasionally be closer to the BF16+lora baseline. Dynamic applies LoRA at inference time, which is slow and only works for conventional lora."}),
