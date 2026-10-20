@@ -50,7 +50,7 @@ import comfy.utils
 import comfy.model_management
 import comfy.model_detection
 
-from .int8_unet_loader import MODEL_TYPE_EXCLUSIONS
+from .int8_unet_loader import MODEL_TYPE_EXCLUSIONS, MODEL_TYPE_INT8_KEEP
 from .grouped_quant import (
     FORMAT_W4A8, FORMAT_W6A8, GROUPED_BITS,
     kitchen_support, grouped_spec, int8_spec,
@@ -72,9 +72,10 @@ def _flat(t):
     raise TypeError(f"unsupported model output type {type(t)}")
 
 
-def _build_plan(reader, donor, model_type, fmt, format_name, group, label):
+def _build_plan(reader, donor, model_type, fmt, format_name, group, label, int8_keep=False):
     """Plan entries for every tensor of the (normalized, donor-merged) model."""
     excluded = MODEL_TYPE_EXCLUSIONS.get(model_type, [])
+    keep8 = MODEL_TYPE_INT8_KEEP.get(model_type, []) if int8_keep else []
     metadata = dict(reader.metadata)
 
     if any(k.endswith(".comfy_quant") for k in reader.keys) or "_quantization_metadata" in metadata:
@@ -130,6 +131,7 @@ def _build_plan(reader, donor, model_type, fmt, format_name, group, label):
                      f"+ metadata from the donor.")
 
     plan, n_fallback, fallback_examples = [], 0, []
+    n_keep8 = 0
     for out_key, rdr, src_key, from_donor in sources:
         shape = rdr.shape(src_key)
         dtype = rdr.dtype(src_key)
@@ -141,11 +143,19 @@ def _build_plan(reader, donor, model_type, fmt, format_name, group, label):
         if from_donor or not is_lin:
             plan.append(e)
             continue
+        n, k = int(shape[0]), int(shape[1])
+        if keep8 and any(p in out_key for p in keep8):
+            # INT8-keep layers: int8 ConvRot instead of source precision.
+            e["out_base"] = out_key[:-len(".weight")]
+            e["action"] = "int8"
+            e["spec"] = int8_spec(k, n)
+            n_keep8 += 1
+            plan.append(e)
+            continue
         if any(ex in out_key for ex in excluded):
             e["action"] = "bf16"
             plan.append(e)
             continue
-        n, k = int(shape[0]), int(shape[1])
         e["out_base"] = out_key[:-len(".weight")]
         if k % 256 == 0 and k % int(group) == 0:
             e["action"] = "grouped"
@@ -157,6 +167,9 @@ def _build_plan(reader, donor, model_type, fmt, format_name, group, label):
             if len(fallback_examples) < 4:
                 fallback_examples.append(f"{e['out_base']} (K={k}, cg={e['spec']['cg']})")
         plan.append(e)
+    if keep8:
+        logging.info(f"{label}: int8_keep_layers — {n_keep8} layers matching {keep8} stored as "
+                     f"INT8 ConvRot instead of source precision.")
     if n_fallback:
         logging.info(f"{label}: {n_fallback} layers with K not divisible by 256/group use the "
                      f"int8 ConvRot fallback, e.g. {fallback_examples}")
@@ -408,6 +421,7 @@ class _DiffusionGroupedBase:
         if mixed:
             req["w6a8_last_blocks"] = ("INT", {"default": 0, "min": 0, "max": 512, "tooltip": "Mixed W4A8/W6A8: the last N transformer blocks of the main block stack use W6A8 (0 = all W4A8). The last blocks carry most of the quantization error; e.g. MOSS (42 blocks): 12 roughly halves W4 output error for ~12% more file, 18 gets close to all-W6A8."})
             req["w6a8_group_size"] = (["16", "32", "64"], {"default": "16", "tooltip": "Group size of the W6A8 blocks (16 = 6.5 bits/weight, lowest error)."})
+            req["int8_keep_layers"] = ("BOOLEAN", {"default": False, "tooltip": "Store the model's INT8-keep layers (MiniMax H3 token_refiner, MOSS text_embedder) as INT8 ConvRot instead of bf16."})
         calib = {
             "calib_model": ("MODEL", {"tooltip": "The SAME checkpoint (bf16, or fp8 weights for very large models). Needed for gptq and weights+timesteps."}),
             "calib_latent": ("LATENT", {"tooltip": "Empty latent at the resolution (and frame count) you will generate at."}),
@@ -428,7 +442,7 @@ class _DiffusionGroupedBase:
              calib_negative, calib_latent, method="rtn", gptq_damp=0.01, gptq_act_order=True,
              gptq_sequential=True, gptq_max_tokens=4096, gptq_budget_gb=4.0, gptq_holdout=False,
              calib_samples=1, bits=None, label=None, calib_clip=None, calib_prompts="",
-             w6a8_last_blocks=0, w6a8_group_size="16"):
+             w6a8_last_blocks=0, w6a8_group_size="16", int8_keep_layers=False):
         bits = bits or self.BITS
         fmt = FORMAT_W4A8 if bits == 4 else FORMAT_W6A8
         label = label or ("W4A8 Codebook" if bits == 4 else "W6A8")
@@ -442,7 +456,8 @@ class _DiffusionGroupedBase:
         reader = SourceReader(folder_paths.get_full_path("diffusion_models", unet_name))
         donor = (SourceReader(folder_paths.get_full_path("diffusion_models", prune_donor))
                  if prune_donor and prune_donor != "None" else None)
-        plan, metadata = _build_plan(reader, donor, model_type, fmt, format_name, group, label)
+        plan, metadata = _build_plan(reader, donor, model_type, fmt, format_name, group, label,
+                                     int8_keep=bool(int8_keep_layers))
 
         n_w6 = _apply_w6_tail(plan, int(w6a8_last_blocks) if bits == 4 else 0,
                               int(w6a8_group_size), label)
@@ -529,6 +544,7 @@ class _DiffusionGroupedBase:
                   "method": method, "gptq": gptq_summary,
                   "w6a8_last_blocks": int(w6a8_last_blocks) if n_w6 else 0,
                   "w6a8_layers": n_w6, "w6a8_group_size": int(w6a8_group_size) if n_w6 else None,
+                  "int8_keep_layers": bool(int8_keep_layers),
                   "measure_error": measure_error, "layers": records}
 
         if want_ts:

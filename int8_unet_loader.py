@@ -12,6 +12,14 @@ import logging
 
 from .int8_quant import Int8TensorwiseOps
 
+# Layers that are excluded from W4A8/W6A8 but may be stored as INT8 ConvRot
+# instead of bf16 (Comfy-Org recipe for MiniMax H3; Kijai's MOSS trick).
+# Used only by the W4A8/W6A8/Video converters when int8_keep_layers is on.
+MODEL_TYPE_INT8_KEEP = {
+    "minimax h3": ['token_refiner'],
+    "moss image": ['text_embedder'],
+}
+
 # Layer-name substrings that must stay in high precision, per model family.
 # Shared by UNetLoaderINTW8A8 (on-the-fly W8A8) and INT4W4A4MixedSave (offline
 # W4A4 + INT8 mixed conversion).
